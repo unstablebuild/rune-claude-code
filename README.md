@@ -44,8 +44,18 @@ make test             # Go tests, with the race detector
 make lint             # golangci-lint
 make plugin-validate  # claude plugin validate plugin
 make plugin-test      # claude plugin test plugin
-make pkg              # stage bin/ and config.yaml under pkg/
+make verify           # build claude-code.tar.gz and check its contents
 ```
+
+`make verify TARGET_OS=linux TARGET_ARCH=arm64` packages another target;
+release builds have cgo off, so any host can build any target.
+
+To release, set `version.Version` and the plugin's `version` to the new
+version, tag the commit `v<version>`, and run `make dist-staging-all`, then
+`make dist-prod-all`. Each uploads the four darwin and linux, arm64 and
+amd64 packages, skipping any already published. They need the bluectl
+configs in `deploy/bluectl/<env>/<os>-<arch>/config`, which are not
+committed, and `BLUE_PGP_KEY` and `BLUE_PGP_KEYRING` to sign the upload.
 
 Run Claude Code against the plugin in this checkout with
 `claude --plugin-dir plugin`.
