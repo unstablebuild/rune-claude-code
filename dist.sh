@@ -33,7 +33,7 @@ fi
 
 # The log since the previous tag, or since the latest tag when HEAD is not
 # tagged.
-if git describe --exact-match HEAD >/dev/null 2>&1; then
+if git describe --tags --exact-match HEAD >/dev/null 2>&1; then
 	GIT_LOG_RANGE="$(git tag -l --sort=-version:refname | head -2 | xargs | sed 's/ /.../g')"
 else
 	GIT_LOG_RANGE="$(git tag -l --sort=-version:refname | head -1)...HEAD"
