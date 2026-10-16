@@ -23,11 +23,6 @@ In Claude Code, started from a Rune terminal:
 /plugin install rune@unstablebuild
 ```
 
-Sessions started in Rune's terminals then connect to Rune by themselves:
-the package sets `CLAUDE_CODE_AUTO_CONNECT_IDE=true` there through
-`gui.env`. `/ide` lists Rune and `/mcp` lists `plugin:rune:rune` once
-connected.
-
 See the [Claude Code guide](https://docs.rune.build/agent/claude-code) for
 everything the integration does.
 

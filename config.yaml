@@ -1,3 +1,9 @@
+gui:
+  env:
+    # Claude Code connects by itself only to IDEs whose terminals it
+    # recognizes, and Rune's is not one of them, so turn it on for
+    # sessions started in Rune's terminals.
+    CLAUDE_CODE_AUTO_CONNECT_IDE: 'true'
 extensions:
   claude-code:
     path: '$RUNE_DATADIR/bin/extension_claude_code'
