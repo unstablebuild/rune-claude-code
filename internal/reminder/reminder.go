@@ -38,9 +38,8 @@ const Key = "plugin_reminder_dismissed"
 // Message is the reminder's text.
 const Message = "Finish connecting Claude Code to Rune. In Claude Code, run:\n\n" +
 	"  /plugin marketplace add unstablebuild/rune-claude-code\n" +
-	"  /plugin install rune@rune\n\n" +
-	"Then turn on \"Auto-connect to IDE (external terminal)\" in /config, " +
-	"or start Claude Code with claude --ide."
+	"  /plugin install rune@unstablebuild\n\n" +
+	"Claude Code sessions you start in new Rune terminals then connect to Rune."
 
 // Option is the reminder's only button.
 const Option = "Already installed"

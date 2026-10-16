@@ -1,0 +1,4 @@
+{
+  "description": "Rune symbol completion and @-mentions in the prompt, language-server references beside Grep results, a diagnostics pane, and a version check against the Rune extension",
+  "modules": ["./register.tsx"]
+}

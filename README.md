@@ -20,17 +20,18 @@ In Claude Code, started from a Rune terminal:
 
 ```
 /plugin marketplace add unstablebuild/rune-claude-code
-/plugin install rune@rune
+/plugin install rune@unstablebuild
 ```
 
-Then turn on **Auto-connect to IDE (external terminal)** in `/config`, or
-start sessions with `claude --ide`. `/ide` lists Rune and `/mcp` lists
-`plugin:rune:rune` once connected.
+Sessions started in Rune's terminals then connect to Rune by themselves:
+the package sets `CLAUDE_CODE_AUTO_CONNECT_IDE=true` there through
+`gui.env`. `/ide` lists Rune and `/mcp` lists `plugin:rune:rune` once
+connected.
 
 See the [Claude Code guide](https://docs.rune.build/agent/claude-code) for
 everything the integration does.
 
-## Layout
+## Develop
 
 | Path | What it is |
 | --- | --- |
@@ -42,8 +43,6 @@ everything the integration does.
 The extension, `rune-claude` and the plugin are released together under
 one tag. `version.Protocol` and the plugin's `PROTOCOL` change together
 when a tool the plugin calls changes incompatibly.
-
-## Develop
 
 ```
 make test             # Go tests, with the race detector

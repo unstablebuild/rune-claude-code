@@ -1,0 +1,10 @@
+{
+  "name": "rune",
+  "version": "0.1.0",
+  "description": "Connects Claude Code to the Rune IDE: Rune's language servers, diagnostics and symbols as tools, and symbol completion and @-mentions in the prompt. Requires the claude-code package in Rune (pkg install claude-code).",
+  "author": {
+    "name": "Unstable Build",
+    "email": "it@unstable.build"
+  },
+  "homepage": "https://github.com/unstablebuild/rune-claude-code"
+}

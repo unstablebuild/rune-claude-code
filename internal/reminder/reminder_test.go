@@ -40,7 +40,7 @@ func TestButtonDismisses(t *testing.T) {
 		Alignment: component.AlignmentCentered, Title: "Claude Code",
 	}, wm.configs[0])
 	assert.Contains(t, Message, "/plugin marketplace add unstablebuild/rune-claude-code")
-	assert.Contains(t, Message, "/plugin install rune@rune")
+	assert.Contains(t, Message, "/plugin install rune@unstablebuild")
 
 	// Showing again while open does nothing.
 	require.NoError(t, r.Show(context.Background()))

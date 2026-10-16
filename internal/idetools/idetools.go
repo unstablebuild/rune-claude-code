@@ -234,7 +234,7 @@ func (i *IDE) HandleCommand(_ context.Context, cmd textapi.Command) error {
 	}
 	if i.clients.Load() == 0 {
 		return errors.New("no Claude Code session is connected to this " +
-			"workspace; run claude --ide in a Rune terminal")
+			"workspace; start claude in a Rune terminal")
 	}
 	m := ideserver.AtMentioned{FilePath: cmd.URI.Path()}
 	i.mu.Lock()
