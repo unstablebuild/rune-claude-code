@@ -16,6 +16,7 @@ package reminder
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +70,35 @@ func TestCloseKeepsReminding(t *testing.T) {
 
 	require.NoError(t, r.Show(context.Background()))
 	assert.Len(t, wm.floating, 2)
+}
+
+func TestButtonLooksLikeHostPrompts(t *testing.T) {
+	wm := &fakeWM{}
+	require.NoError(t, New(storagestub.NewInMemoryService(), wm).Show(context.Background()))
+	p := wm.floating[0].(*handler.Prompt)
+	width, height := p.Dimensions()
+	p.Resize(width, height)
+	w := term.NewStringWriter(width, height)
+	p.Draw(w)
+	require.NoError(t, w.Flush())
+
+	rows := strings.Split(w.String(), "\n")
+	cells := w.Cells()
+	for y, row := range rows {
+		x := strings.Index(row, Option)
+		if x < 0 {
+			continue
+		}
+		button := cells[y*width : (y+1)*width]
+		for i := x - 2; i < x+len(Option)+2; i++ {
+			assert.Equal(t, ButtonAttr.Bg, button[i].Bg, "cell %d", i)
+			assert.Equal(t, ButtonAttr.Fg, button[i].Fg, "cell %d", i)
+		}
+		assert.NotEqual(t, ButtonAttr.Bg, button[x-3].Bg, "two cells of padding on the left")
+		assert.NotEqual(t, ButtonAttr.Bg, button[x+len(Option)+2].Bg, "two cells of padding on the right")
+		return
+	}
+	t.Fatalf("no button in:\n%s", w.String())
 }
 
 func TestPluginConnectionDismisses(t *testing.T) {

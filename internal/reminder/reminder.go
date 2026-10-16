@@ -28,6 +28,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
 	"github.com/unstablebuild/rune-go-sdk/component"
 	"github.com/unstablebuild/rune-go-sdk/handler"
+	"github.com/unstablebuild/rune-go-sdk/term"
 )
 
 // Key is the storage document that records the reminder was dismissed.
@@ -43,6 +44,13 @@ const Message = "Finish connecting Claude Code to Rune. In Claude Code, run:\n\n
 
 // Option is the reminder's only button.
 const Option = "Already installed"
+
+// ButtonAttr is the button's color, the default of the host's own
+// prompts (prompt.highlight_attr).
+var ButtonAttr = term.Attributes{Bg: term.ColorRed, Fg: term.ColorWhite}
+
+// buttonPad is the space on each side of the button's label.
+const buttonPad = "  "
 
 // dismissal is the document stored under Key.
 type dismissal struct {
@@ -84,8 +92,9 @@ func (r *Reminder) Show(ctx context.Context) error {
 	prompt := handler.NewPrompt(handler.PromptConfig{
 		PromptConfig: component.PromptConfig{
 			Message: Message,
-			Options: []string{Option},
+			Options: []string{buttonPad + Option + buttonPad},
 		},
+		HighlightAttr: ButtonAttr,
 		PromptHandler: handler.FuncPromptHandler(
 			func(int, string) {
 				// The host waits for this call; storage is reached
