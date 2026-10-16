@@ -1,0 +1,19 @@
+# build output
+bin/
+pkg/
+target/
+*.tar.gz
+
+# local release configuration
+deploy/bluectl/
+
+# test binaries and coverage
+*.test
+*.out
+
+# editors and OS
+*.swp
+.DS_Store
+
+# written by Claude Code when it loads the plugin from this folder
+plugin/.claude-plugin/types/

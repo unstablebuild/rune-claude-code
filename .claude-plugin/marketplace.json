@@ -1,0 +1,15 @@
+{
+  "name": "rune",
+  "description": "Claude Code plugins for the Rune IDE",
+  "owner": {
+    "name": "Unstable Build",
+    "email": "it@unstable.build"
+  },
+  "plugins": [
+    {
+      "name": "rune",
+      "source": "./plugin",
+      "description": "Connects Claude Code to the Rune IDE: Rune's language servers, diagnostics and symbols as tools, and symbol completion and @-mentions in the prompt."
+    }
+  ]
+}
