@@ -1,8 +1,8 @@
-import type { EngineInterface, McpToolResult, On } from 'claude-code'
+import type { EngineInterface, McpToolResult, On, PromptOrigin } from 'claude-code'
 
 // PROTOCOL is the version of the extension's tools this mod calls; the
 // extension's rune_version reports its own.
-export const PROTOCOL = 1
+export const PROTOCOL = 2
 
 // SERVER is the key of the extension's MCP server in this plugin's .mcp.json.
 const SERVER = 'rune'
@@ -16,19 +16,27 @@ const RETRY_MS = 30_000
 const MAX_REFERENCES = 100
 const MAX_DIAGNOSTICS = 200
 const MIN_MENTION_PREFIX = 3
+// A submitted prompt waits on Rune to place at most MAX_PROMPT_NAMES of the
+// names it mentions, for at most RESOLVE_MS, so a cold index cannot hold up
+// Enter.
+const MAX_PROMPT_NAMES = 5
+export const RESOLVE_MS = 1_500
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
 const QUALIFIED = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$/
+// A qualified name in a prompt's prose (`term.Writer`, `pkg.Type.Method`):
+// not one right after an @, which prompt.mention places, nor one inside a
+// path or URL.
+const PROSE_NAME = /(?<![\w@./\\:-])[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+(?![\w/\\-]|\.\w|:\/\/)/g
 // A prompt token worth completing: a qualified prefix (`fmt.Pr`), or a bare
 // one after an @ (`@ideser`), which completes to a mention.
 const COMPLETABLE = /^(@?)([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]*)*)$/
 
-type Symbol = {
+// Definition is where symbol_definition says a symbol is defined, 1-based.
+type Definition = {
   path: string
   line: number
   column: number
-  display?: string
-  importPath?: string
 }
 
 type Location = { uri: string; start_line: number; start_char: number }
@@ -136,6 +144,47 @@ async function referencesOf($: EngineInterface, state: State, name: string): Pro
       'declarations included. Matches above that are not among them are comments, strings or other text.',
     ...lines,
   ].join('\n')
+}
+
+// isTyped tells the person's own prompt from one a notification, a peer, a
+// schedule or a plugin sent.
+function isTyped(origin: PromptOrigin): boolean {
+  return origin.kind === 'composer' || origin.kind === 'bridge' || origin.kind === 'sdk'
+}
+
+// definitionsNote says where Rune finds each of names defined, leaving out
+// any it does not place within RESOLVE_MS; null when it places none.
+async function definitionsNote($: EngineInterface, state: State, names: readonly string[]): Promise<string | null> {
+  const stop = new AbortController()
+  const deadline = $.clock.sleep(RESOLVE_MS, { signal: stop.signal }).then(
+    () => null,
+    () => null,
+  )
+  // One connection for every lookup.
+  const connected = serverOf($, state)
+  const lookup = async (name: string) =>
+    (await connected) === null ? null : call<Definition[]>($, state, 'symbol_definition', { name })
+  const found = await Promise.all(names.map(name => Promise.race([lookup(name).catch(() => null), deadline])))
+  stop.abort()
+  const lines = names.flatMap((name, i) => {
+    const defs = found[i] ?? []
+    return defs.length === 0
+      ? []
+      : [`\`${name}\` is defined at ${defs.map(d => `${d.path}:${d.line}:${d.column}`).join(', ')}.`]
+  })
+  return lines.length === 0 ? null : ["Rune's language servers place names in this prompt:", ...lines].join('\n')
+}
+
+// namesIn lists the first MAX_PROMPT_NAMES distinct qualified names in text.
+export function namesIn(text: string): string[] {
+  const names = new Set<string>()
+  for (const [name] of text.matchAll(PROSE_NAME)) {
+    names.add(name)
+    if (names.size === MAX_PROMPT_NAMES) {
+      break
+    }
+  }
+  return [...names]
 }
 
 export function register(on: On) {
@@ -249,23 +298,33 @@ export function register(on: On) {
     return { suggestions: [...below.suggestions, ...mine] }
   })
 
+  // A prompt the person typed that names qualified symbols says where they
+  // are defined, so the model starts from the definition instead of a search.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.command !== undefined || e.isMeta || !isTyped(e.origin)) {
+      return next(e)
+    }
+    const names = namesIn(e.text)
+    const note = names.length === 0 ? null : await definitionsNote($, state, names)
+    return next(note === null ? e : { ...e, context: [...(e.context ?? []), note] })
+  }).catch(($, e, next) => next(e))
+
   // @pkg.Symbol attaches the file that defines the symbol, when no file of
   // that name is there.
   on('prompt.mention', async ($, e, next) => {
     if (!QUALIFIED.test(e.mention) || (await $.fs.exists(e.path))) {
       return next(e)
     }
-    const symbols = await call<Symbol[]>($, state, 'symbol_resolve', { name: e.mention }).catch(() => null)
-    const symbol = symbols?.[0]
-    if (symbol === undefined) {
+    const defs = await call<Definition[]>($, state, 'symbol_definition', { name: e.mention }).catch(() => null)
+    const def = defs?.[0]
+    if (def === undefined) {
       return next(e)
     }
-    const result = await next({ ...e, path: symbol.path })
+    const result = await next({ ...e, path: def.path })
     if (result.deny !== undefined || result.type === null) {
       return result
     }
-    const what = symbol.display ? `\`${symbol.display}\`` : `\`${e.mention}\``
-    const note = `@${e.mention} refers to ${what}, defined at ${symbol.path}:${symbol.line}:${symbol.column}.`
+    const note = `@${e.mention} is defined at ${def.path}:${def.line}:${def.column}.`
     return { ...result, context: [...(result.context ?? []), note] }
   }).catch(($, e, next) => next(e))
 

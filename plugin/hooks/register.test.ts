@@ -1,7 +1,15 @@
-import type { McpToolResult, On, PromptAutocompleteInput, PromptAutocompleteResult, RenderPropsOf } from 'claude-code'
+import type {
+  McpToolResult,
+  On,
+  PromptAutocompleteInput,
+  PromptAutocompleteResult,
+  PromptSubmitInput,
+  RenderPropsOf,
+} from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { MockClock } from 'claude-code/testing'
 
-import { PANE, PROTOCOL } from './register'
+import { PANE, PROTOCOL, RESOLVE_MS } from './register'
 
 const PLUGIN = 'rune'
 const SERVER = 'plugin:rune:rune'
@@ -13,6 +21,7 @@ type Answer = unknown | ((args: Record<string, unknown>) => unknown)
 // what the plugin asked of the engine.
 type World = {
   settle: () => Promise<void>
+  clock: MockClock
   calls: { tool: string; args: Record<string, unknown> }[]
   statuses: (string | undefined)[]
   commands: string[]
@@ -32,21 +41,21 @@ function failure(message: string): McpToolResult {
 // outside Rune when it is null.
 function worldOf(on: On, tools: Record<string, Answer> | null, files: readonly string[] = []): World {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const world: World = { settle: clock.settle, calls: [], statuses: [], commands: [], opened: [], open: new Set() }
+  const world: World = { settle: clock.settle, clock, calls: [], statuses: [], commands: [], opened: [], open: new Set() }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('mcp.connect', () =>
     tools === null
       ? { value: { isConnected: false, reason: 'failed', message: 'rune-claude exited' } }
       : { value: { isConnected: true, server: SERVER } },
   )
-  on('mcp.call', ($, e) => {
+  on('mcp.call', async ($, e) => {
     expect(e.server).toBe(SERVER)
     world.calls.push({ tool: e.tool, args: e.args })
     const answer = tools?.[e.tool]
     if (answer === undefined) {
       return { value: failure(`unknown tool ${e.tool}`) }
     }
-    const value = typeof answer === 'function' ? answer(e.args) : answer
+    const value = typeof answer === 'function' ? await answer(e.args) : answer
     return { value: (value as McpToolResult).content !== undefined ? (value as McpToolResult) : text(value) }
   })
   on('fs.exists', ($, e) => ({ value: files.includes(e.path) }))
@@ -180,7 +189,7 @@ describe('completion', () => {
 describe('mentions', () => {
   test('@pkg.Symbol attaches the file that defines it and says where', async ($, on) => {
     const world = worldOf(on, {
-      symbol_resolve: [{ path: '/work/internal/ideserver/server.go', line: 42, column: 6, display: 'func Start' }],
+      symbol_definition: [{ path: '/work/internal/ideserver/server.go', line: 42, column: 6 }],
     })
     const read: string[] = []
     on('prompt.mention', ($, e) => {
@@ -190,15 +199,14 @@ describe('mentions', () => {
 
     const result = await $.prompt.mention({ mention: 'ideserver.Start', path: '/work/ideserver.Start' })
 
-    expect(world.calls).toEqual([{ tool: 'symbol_resolve', args: { name: 'ideserver.Start' } }])
+    expect(world.calls).toEqual([{ tool: 'symbol_definition', args: { name: 'ideserver.Start' } }])
     expect(read).toEqual(['/work/internal/ideserver/server.go'])
     expect(result.type).toBe('file')
-    expect(result.context?.[0]).toContain('/work/internal/ideserver/server.go:42:6')
-    expect(result.context?.[0]).toContain('func Start')
+    expect(result.context).toEqual(['@ideserver.Start is defined at /work/internal/ideserver/server.go:42:6.'])
   })
 
   test('a file that is there is read as named', async ($, on) => {
-    const world = worldOf(on, { symbol_resolve: [] }, ['/work/main.go'])
+    const world = worldOf(on, { symbol_definition: [] }, ['/work/main.go'])
     const read: string[] = []
     on('prompt.mention', ($, e) => {
       read.push(e.path)
@@ -213,7 +221,7 @@ describe('mentions', () => {
   })
 
   test('a name Rune does not know is read as named', async ($, on) => {
-    worldOf(on, { symbol_resolve: [] })
+    worldOf(on, { symbol_definition: failure('symbol "nope.Missing" not found') })
     const read: string[] = []
     on('prompt.mention', ($, e) => {
       read.push(e.path)
@@ -223,6 +231,100 @@ describe('mentions', () => {
     await $.prompt.mention({ mention: 'nope.Missing', path: '/work/nope.Missing' })
 
     expect(read).toEqual(['/work/nope.Missing'])
+  })
+})
+
+describe('names in a prompt', () => {
+  const HEADER = "Rune's language servers place names in this prompt:"
+  const typed = (text: string): PromptSubmitInput => ({ text, wait: false, origin: { kind: 'composer' } })
+  const at = (path: string) => [{ path, line: 121, column: 6 }]
+
+  // reached records each prompt as it reached the engine beneath the plugin.
+  function reached(on: On): PromptSubmitInput[] {
+    const prompts: PromptSubmitInput[] = []
+    on('prompt.submit', ($, e) => {
+      prompts.push(e)
+      return { text: e.text, context: e.context }
+    })
+    return prompts
+  }
+
+  test('a qualified name gains where it is defined', async ($, on) => {
+    const world = worldOf(on, {
+      symbol_definition: (args: Record<string, unknown>) =>
+        args.name === 'term.Writer' ? at('/sdk/term/structures.go') : failure(`symbol "${args.name}" not found`),
+    })
+    const prompts = reached(on)
+
+    await $.prompt.submit(typed('`term.Writer` what is it? Is it in review.go? term.Writer.'))
+
+    expect(world.calls).toEqual([
+      { tool: 'symbol_definition', args: { name: 'term.Writer' } },
+      { tool: 'symbol_definition', args: { name: 'review.go' } },
+    ])
+    expect(prompts[0]?.context).toEqual([`${HEADER}\n\`term.Writer\` is defined at /sdk/term/structures.go:121:6.`])
+  })
+
+  test('mentions, paths, URLs and plain words are not looked up', async ($, on) => {
+    const world = worldOf(on, { symbol_definition: at('/a.go') })
+    const prompts = reached(on)
+
+    await $.prompt.submit(
+      typed('Read @ideserver.Start, internal/difftab/review.go and https://pkg.go.dev/fmt.Println, then the docs.'),
+    )
+
+    expect(world.calls).toEqual([])
+    expect(prompts[0]?.context).toBeUndefined()
+  })
+
+  test('commands, hidden prompts and prompts the person did not type are left alone', async ($, on) => {
+    const world = worldOf(on, { symbol_definition: at('/a.go') })
+    const prompts = reached(on)
+
+    await $.prompt.submit({ ...typed('/review term.Writer'), command: { name: 'review', args: 'term.Writer' } })
+    await $.prompt.submit({ ...typed('term.Writer'), isMeta: true })
+    await $.prompt.submit({ ...typed('term.Writer'), origin: { kind: 'peer' } })
+
+    expect(world.calls).toEqual([])
+    expect(prompts.map(p => p.context)).toEqual([undefined, undefined, undefined])
+  })
+
+  test('at most five names are looked up', async ($, on) => {
+    const world = worldOf(on, { symbol_definition: [] })
+    reached(on)
+
+    await $.prompt.submit(typed('a.A b.B a.A c.C d.D e.E f.F'))
+
+    expect(world.calls.map(c => c.args.name)).toEqual(['a.A', 'b.B', 'c.C', 'd.D', 'e.E'])
+  })
+
+  test('a name Rune is slow to place is left out', async ($, on) => {
+    const world: World = worldOf(on, {
+      symbol_definition: async (args: Record<string, unknown>) => {
+        if (args.name === 'slow.Name') {
+          await world.clock.sleep(10 * RESOLVE_MS)
+        }
+        return at(`/${args.name}.go`)
+      },
+    })
+    const prompts = reached(on)
+
+    const submitted = $.prompt.submit(typed('fast.Name and slow.Name'))
+    await world.settle()
+    await world.clock.advance(RESOLVE_MS)
+    await submitted
+
+    expect(prompts[0]?.context).toEqual([`${HEADER}\n\`fast.Name\` is defined at /fast.Name.go:121:6.`])
+    await world.clock.advance(10 * RESOLVE_MS)
+  })
+
+  test('outside Rune the prompt goes on as typed', async ($, on) => {
+    worldOf(on, null)
+    const prompts = reached(on)
+
+    await $.prompt.submit(typed('term.Writer'))
+
+    expect(prompts[0]?.context).toBeUndefined()
   })
 })
 

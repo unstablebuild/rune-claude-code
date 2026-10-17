@@ -18,9 +18,9 @@ package version
 
 // Version is the release of the extension, the rune-claude helper and
 // the Claude Code plugin, which are tagged together.
-const Version = "0.1.1"
+const Version = "0.1.2"
 
 // Protocol is the version of the contract between the plugin's mod and
 // the extension's tools. It changes when a tool the mod calls changes
 // incompatibly, so the mod can ask the user to update.
-const Protocol = 1
+const Protocol = 2

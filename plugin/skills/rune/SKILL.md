@@ -9,16 +9,25 @@ This session runs inside the Rune IDE. The `rune` MCP server exposes the
 language servers Rune runs for this workspace, so answers about code come
 from the compiler's view of it rather than from text matches.
 
-## Prefer semantic tools over Grep for code
+## Use the semantic tools, not grep, for code
 
-- Where something is defined: `lsp_definition`, or `symbol_resolve` for a
-  qualified name such as `pkg.Symbol`.
+For symbols, use the `lsp_*` tools instead of grep or rg, whether through
+Grep or Bash. Pass names qualified by their package or type, such as
+`term.Writer` or `Order.Total`: Rune's symbol index then finds the symbol
+even when a dependency defines it, while a bare name only matches symbols
+defined in the workspace.
+
+- What a symbol is (its type, signature and docs): `lsp_documentation`.
+- Where something is defined: `lsp_definition`.
 - Who uses it: `lsp_references`. Grep also matches comments, strings and
   unrelated names that share the text; references do not.
 - Who implements an interface, or what a type implements:
   `lsp_implementation`.
-- What a file contains: `lsp_document_symbols`. Finding a symbol by name:
-  `lsp_workspace_symbols`.
+- What a file contains: `outline_file`, which lists each symbol with its
+  line. Finding a symbol by name: `lsp_workspace_symbols`.
+
+When a tool's answer comes with a note (the name was bare, or it matched
+more places than were looked at), qualify the name further and ask again.
 - Renaming: `lsp_rename` returns every edit the language server would make,
   across files.
 - Structural patterns (all calls with two arguments, every method on a

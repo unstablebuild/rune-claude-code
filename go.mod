@@ -7,7 +7,7 @@ require (
 	github.com/mark3labs/mcp-go v0.44.0
 	github.com/sergi/go-diff v1.4.0
 	github.com/stretchr/testify v1.11.1
-	github.com/unstablebuild/rune-go-sdk v0.15.0
+	github.com/unstablebuild/rune-go-sdk v0.15.1
 )
 
 require (

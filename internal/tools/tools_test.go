@@ -56,18 +56,18 @@ func TestToolsListed(t *testing.T) {
 			alwaysLoad = append(alwaysLoad, tool.Name)
 		}
 	}
-	assert.Len(t, names, 33+6)
+	assert.Len(t, names, 33+7)
 	for _, name := range []string{
 		"lsp_definition", "lsp_rename", "syntax_search", "rune_open",
-		"rune_highlight", "rune_notify", "symbol_complete", "symbol_resolve",
-		"rune_version",
+		"rune_highlight", "rune_notify", "symbol_complete", "symbol_definition",
+		"rune_version", "outline_file",
 	} {
 		assert.Contains(t, names, name)
 	}
 	slices.Sort(alwaysLoad)
 	assert.Equal(t, []string{
-		"lsp_definition", "lsp_diagnostics", "lsp_document_symbols",
-		"lsp_implementation", "lsp_references", "lsp_workspace_symbols",
+		"lsp_definition", "lsp_diagnostics", "lsp_documentation", "lsp_implementation",
+		"lsp_references", "lsp_workspace_symbols", "outline_file",
 	}, alwaysLoad)
 
 	var init struct {
@@ -78,7 +78,10 @@ func TestToolsListed(t *testing.T) {
 		"clientInfo":      map[string]any{"name": "claude-code", "version": "2.1.300"},
 		"capabilities":    map[string]any{},
 	}), &init))
-	assert.Contains(t, init.Instructions, "Prefer the lsp_* tools over Grep")
+	assert.Contains(t, init.Instructions, "instead of grep or rg, whether through Grep or Bash")
+	assert.Contains(t, init.Instructions, "pkg.Symbol")
+	assert.Contains(t, init.Instructions, "lsp_documentation")
+	assert.Contains(t, init.Instructions, "outline_file")
 }
 
 func TestRuneOpen(t *testing.T) {
@@ -199,18 +202,87 @@ func TestSymbolComplete(t *testing.T) {
 	}, 5*time.Second, time.Millisecond)
 }
 
-func TestSymbolResolve(t *testing.T) {
+// symbol_definition answers where a symbol is defined, which is not the
+// site Rune's symbol index finds: that is often a reference.
+func TestSymbolDefinition(t *testing.T) {
+	const review = "file:///ws/internal/difftab/review.go"
 	f := newFixture(t)
-	f.parser.matches["http.Handler"] = []syntaxapi.Match{{
-		URI: "file:///go/src/net/http/server.go", Pos: term.Coordinates{X: 5, Y: 85},
-		Display: "type Handler interface", ImportPath: "net/http",
-	}}
-	res := callTool(t, f.tools.Server(), "symbol_resolve", map[string]any{"name": "http.Handler"})
-	assert.JSONEq(t, `[{"path":"/go/src/net/http/server.go","line":86,"column":6,
-		"display":"type Handler interface","importPath":"net/http"}]`, resultText(t, res))
+	f.parser.matches["term.Writer"] = []syntaxapi.Match{
+		{URI: review, Pos: term.Coordinates{X: 7, Y: 41}, Display: "term.Writer"},
+		{URI: review, Pos: term.Coordinates{X: 9, Y: 60}, Display: "term.Writer"},
+	}
+	f.lsp.defs[review] = "file:///mod/rune-go-sdk/term/structures.go"
+	define := func(name string) mcp.CallToolResult {
+		return callTool(t, f.tools.Server(), "symbol_definition", map[string]any{"name": name})
+	}
 
-	res = callTool(t, f.tools.Server(), "symbol_resolve", map[string]any{"name": "Handler"})
-	assert.Equal(t, "[]", resultText(t, res))
+	res := define("term.Writer")
+	require.False(t, res.IsError, resultText(t, res))
+	assert.JSONEq(t, `[{"path":"/mod/rune-go-sdk/term/structures.go","line":121,"column":6}]`,
+		resultText(t, res), "both references lead to one definition")
+	assert.Equal(t, []string{review + ":41:7", review + ":60:9"}, f.lsp.asked)
+	assert.Empty(t, f.lsp.searched, "the index answered")
+	assert.Len(t, res.Content, 1, "no hint for a qualified name")
+
+	f.lsp.symbols = []semanticapi.SymbolInformation{{
+		Name: "Handler", Kind: semanticapi.SymbolKindInterface,
+		Location: semanticapi.Location{URI: "file:///ws/h.go", Range: semanticapi.Range{
+			Start: semanticapi.Position{Line: 3, Character: 5},
+		}},
+	}}
+	res = define("Handler")
+	require.False(t, res.IsError, resultText(t, res))
+	assert.JSONEq(t, `[{"path":"/ws/h.go","line":4,"column":6}]`, resultText(t, res),
+		"a bare name falls back to the workspace's symbols")
+	require.Len(t, res.Content, 2)
+	hint, ok := res.Content[1].(mcp.TextContent)
+	require.True(t, ok)
+	assert.Contains(t, hint.Text, `"Handler" has no qualifier`)
+
+	res = define("nope.Missing")
+	assert.True(t, res.IsError)
+	assert.Contains(t, resultText(t, res), `"nope.Missing" not found`)
+}
+
+func TestOutlineFile(t *testing.T) {
+	f := newFixture(t)
+	sym := func(name string, kind semanticapi.SymbolKind, line uint32,
+		children ...semanticapi.DocumentSymbol) semanticapi.DocumentSymbol {
+		return semanticapi.DocumentSymbol{Name: name, Kind: kind, Children: children,
+			Range: semanticapi.Range{Start: semanticapi.Position{Line: line}}}
+	}
+	f.lsp.outline = semanticapi.DocumentSymbolResult{DocumentSymbols: []semanticapi.DocumentSymbol{
+		sym("Server", semanticapi.SymbolKindStruct, 9,
+			sym("addr", semanticapi.SymbolKindField, 10)),
+		sym("Server.Start", semanticapi.SymbolKindMethod, 14,
+			sym("ln", semanticapi.SymbolKindVariable, 15,
+				sym("x", semanticapi.SymbolKindVariable, 16))),
+	}}
+	outline := func(path string) mcp.CallToolResult {
+		return callTool(t, f.tools.Server(), "outline_file", map[string]any{"path": path})
+	}
+
+	res := outline("/ws/server.go")
+	require.False(t, res.IsError, resultText(t, res))
+	assert.Equal(t, "/ws/server.go:10:struct:Server\n"+
+		"/ws/server.go:11:field:Server.addr\n"+
+		"/ws/server.go:15:method:Server.Start\n"+
+		"/ws/server.go:16:variable:Server.Start.ln\n"+
+		"/ws/server.go:17:variable:ln.x\n", resultText(t, res))
+	assert.Equal(t, []string{"file:///ws/server.go"}, f.lsp.outlined)
+
+	f.lsp.outline = semanticapi.DocumentSymbolResult{SymbolInformation: []semanticapi.SymbolInformation{{
+		Name: "main", Kind: semanticapi.SymbolKindFunction,
+		Location: semanticapi.Location{URI: "file:///ws/main.go", Range: semanticapi.Range{
+			Start: semanticapi.Position{Line: 2},
+		}},
+	}}}
+	assert.Equal(t, "/ws/main.go:3:function:main\n", resultText(t, outline("/ws/main.go")))
+
+	f.lsp.outline = semanticapi.DocumentSymbolResult{}
+	assert.Equal(t, "no symbols found", resultText(t, outline("/ws/empty.go")))
+
+	assert.True(t, callTool(t, f.tools.Server(), "outline_file", nil).IsError)
 }
 
 func TestRuneVersion(t *testing.T) {
@@ -222,6 +294,7 @@ func TestRuneVersion(t *testing.T) {
 
 type fixture struct {
 	tools  *Tools
+	lsp    *fakeLSP
 	parser *fakeParser
 	editor *fakeEditor
 	opener *fakeOpener
@@ -233,6 +306,7 @@ func newFixture(t *testing.T) *fixture {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	f := &fixture{
+		lsp:    &fakeLSP{defs: map[string]string{}},
 		parser: &fakeParser{matches: map[string][]syntaxapi.Match{}},
 		editor: &fakeEditor{},
 		opener: &fakeOpener{},
@@ -244,7 +318,7 @@ func newFixture(t *testing.T) *fixture {
 	f.tools = New(ctx, Deps{
 		IDE: idetools.Deps{
 			Editor:        f.editor,
-			LSP:           fakeLSP{},
+			LSP:           f.lsp,
 			Opener:        f.opener,
 			WindowManager: f.wm,
 			FileSystem:    fakeFS{},
@@ -286,7 +360,47 @@ func resultText(t *testing.T, res mcp.CallToolResult) string {
 	return text.Text
 }
 
-type fakeLSP struct{ semanticapi.LSP }
+// fakeLSP answers Definition anywhere in a document listed in defs with
+// 120:5 of the file defs names, as at a reference to a symbol defined
+// there; elsewhere, with the position asked. It records each site asked as
+// uri:line:character.
+type fakeLSP struct {
+	semanticapi.LSP
+	defs     map[string]string
+	symbols  []semanticapi.SymbolInformation
+	outline  semanticapi.DocumentSymbolResult
+	asked    []string
+	searched []string
+	outlined []string
+}
+
+func (l *fakeLSP) DocumentSymbol(
+	_ context.Context, p semanticapi.DocumentSymbolParams,
+) (semanticapi.DocumentSymbolResult, error) {
+	l.outlined = append(l.outlined, p.TextDocument.URI)
+	return l.outline, nil
+}
+
+func (l *fakeLSP) Definition(
+	_ context.Context, p semanticapi.DefinitionParams,
+) (semanticapi.LocationResult, error) {
+	l.asked = append(l.asked, fmt.Sprintf("%s:%d:%d",
+		p.TextDocument.URI, p.Position.Line, p.Position.Character))
+	uri, pos := p.TextDocument.URI, p.Position
+	if def, ok := l.defs[uri]; ok {
+		uri, pos = def, semanticapi.Position{Line: 120, Character: 5}
+	}
+	return semanticapi.LocationResult{Location: &semanticapi.Location{
+		URI: uri, Range: semanticapi.Range{Start: pos, End: pos},
+	}}, nil
+}
+
+func (l *fakeLSP) WorkspaceSymbol(
+	_ context.Context, p semanticapi.WorkspaceSymbolParams,
+) ([]semanticapi.SymbolInformation, error) {
+	l.searched = append(l.searched, p.Query)
+	return l.symbols, nil
+}
 
 type fakeParser struct {
 	syntaxapi.Parser

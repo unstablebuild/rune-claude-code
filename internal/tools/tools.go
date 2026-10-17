@@ -21,17 +21,16 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
+	"github.com/unstablebuild/rune-go-sdk/api/semanticapi"
 	"github.com/unstablebuild/rune-go-sdk/api/syntaxapi"
 	"github.com/unstablebuild/rune-go-sdk/api/textapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/cli/mcptools"
-	"github.com/unstablebuild/rune-go-sdk/iterator"
 	"github.com/unstablebuild/rune-go-sdk/term"
 
 	"github.com/unstablebuild/rune-claude-code/internal/idetools"
@@ -42,10 +41,22 @@ import (
 const highlightID = "claude"
 
 const instructions = "These tools run in Rune, the IDE whose terminal this " +
-	"session runs in. Prefer the lsp_* tools over Grep for definitions, " +
-	"references, implementations, symbols and diagnostics: they ask the " +
-	"workspace's language servers. Use rune_open and rune_highlight to " +
-	"show the user code in Rune."
+	"session runs in. For definitions, references, implementations, " +
+	"symbols and diagnostics, use the lsp_* tools instead of grep or rg, " +
+	"whether through Grep or Bash: they ask the workspace's language " +
+	"servers. Pass symbol names qualified, as pkg.Symbol or Type.Method; " +
+	"that also finds symbols of dependencies. To find out what a symbol " +
+	"is, use lsp_documentation; for what a file defines, outline_file. " +
+	"Use rune_open and rune_highlight to show the user code in Rune."
+
+// alwaysLoad lists the SDK tools Claude Code loads up front rather than
+// deferring: the SDK's defaults and lsp_documentation, which answers what
+// a symbol is, less lsp_document_symbols, which outline_file stands in for
+// with a path instead of a URI. outline_file is loaded up front too.
+var alwaysLoad = []string{
+	"lsp_definition", "lsp_references", "lsp_implementation",
+	"lsp_workspace_symbols", "lsp_diagnostics", "lsp_documentation",
+}
 
 // Events are the editor events Tools.Handle expects.
 var Events = []textapi.EventType{textapi.EventTypeFlush}
@@ -80,7 +91,8 @@ func New(ctx context.Context, deps Deps) *Tools {
 			server.WithInstructions(instructions),
 		),
 	}
-	mcptools.RegisterLSPTools(ctx, t.srv, deps.IDE.LSP, mcptools.WithAllThemes())
+	mcptools.RegisterLSPTools(ctx, t.srv, deps.IDE.LSP, deps.Parser,
+		mcptools.WithAllThemes(), mcptools.WithAlwaysLoad(alwaysLoad...))
 	mcptools.RegisterSyntaxTools(ctx, t.srv, deps.Parser, mcptools.WithAllThemes())
 	t.srv.AddTools(
 		server.ServerTool{Tool: mcp.NewTool("rune_open",
@@ -123,12 +135,18 @@ func New(ctx context.Context, deps Deps) *Tools {
 			mcp.WithString("prefix", mcp.Required()),
 			mcp.WithNumber("limit", mcp.DefaultNumber(defaultLimit)),
 		), Handler: t.complete},
-		server.ServerTool{Tool: mcp.NewTool("symbol_resolve",
+		server.ServerTool{Tool: mcp.NewTool("symbol_definition",
 			mcp.WithDescription("Finds where a qualified symbol, as "+
-				"pkg.Symbol, is defined. Returns [{path, line, column, "+
-				"display, importPath}], lines and columns 1-based."),
+				"pkg.Symbol, is defined, in the workspace or its "+
+				"dependencies. Returns [{path, line, column}], lines and "+
+				"columns 1-based."),
 			mcp.WithString("name", mcp.Required()),
-		), Handler: t.resolve},
+		), Handler: t.definition},
+		server.ServerTool{Tool: alwaysLoaded(mcp.NewTool("outline_file",
+			mcp.WithDescription(outlineDescription),
+			mcp.WithString("path", mcp.Required(),
+				mcp.Description("Absolute path of the file.")),
+		)), Handler: t.outline},
 		server.ServerTool{Tool: mcp.NewTool("rune_version",
 			mcp.WithDescription("Returns the version of Rune's Claude Code "+
 				"extension and of the protocol its plugin speaks."),
@@ -249,48 +267,60 @@ func (t *Tools) complete(
 	return textJSON(t.index.complete(prefix, req.GetInt("limit", defaultLimit)))
 }
 
-// Symbol is a symbol_resolve result.
-type Symbol struct {
-	Path       string `json:"path"`
-	Line       int    `json:"line"`
-	Column     int    `json:"column"`
-	Display    string `json:"display,omitempty"`
-	ImportPath string `json:"importPath,omitempty"`
+// Definition is a symbol_definition result.
+type Definition struct {
+	Path   string `json:"path"`
+	Line   int    `json:"line"`
+	Column int    `json:"column"`
 }
 
-func (t *Tools) resolve(
+// definition asks the language server for the definition at each site of
+// the symbol that Rune's symbol index, or else the workspace's symbols,
+// finds. A site is often a reference, so it is not itself the answer.
+func (t *Tools) definition(
 	ctx context.Context, req mcp.CallToolRequest,
 ) (*mcp.CallToolResult, error) {
 	name, err := req.RequireString("name")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	it, err := t.deps.Parser.ResolveSymbol(ctx, name, nil)
-	if errors.Is(err, syntaxapi.ErrNoDot) {
-		return textJSON([]Symbol{})
-	}
+	lsp := t.deps.IDE.LSP
+	resolved, err := mcptools.ResolveSymbol(ctx, lsp, t.deps.Parser, name, mcptools.HintDefault)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	matches, err := iterator.ToSlice(ctx, it)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	symbols := make([]Symbol, 0, len(matches))
-	for _, m := range matches {
-		uri, err := workspaceapi.ParseURI(m.URI)
-		if err != nil {
-			continue
-		}
-		symbols = append(symbols, Symbol{
-			Path:       uri.Path(),
-			Line:       m.Pos.Y + 1,
-			Column:     m.Pos.X + 1,
-			Display:    m.Display,
-			ImportPath: m.ImportPath,
+	defs := []Definition{}
+	seen := make(map[Definition]bool)
+	for _, site := range resolved.Sites {
+		res, err := lsp.Definition(ctx, semanticapi.DefinitionParams{
+			TextDocument: semanticapi.TextDocumentIdentifier{URI: site.URI},
+			Position:     site.Position,
 		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		for _, loc := range mcptools.ToFlatLocationsFromResult(res) {
+			uri, err := workspaceapi.ParseURI(loc.URI)
+			if err != nil {
+				continue
+			}
+			d := Definition{
+				Path:   uri.Path(),
+				Line:   int(loc.StartLine) + 1,
+				Column: int(loc.StartChar) + 1,
+			}
+			if !seen[d] {
+				seen[d] = true
+				defs = append(defs, d)
+			}
+		}
 	}
-	return textJSON(symbols)
+	res, err := textJSON(defs)
+	if err == nil && resolved.Hint != "" {
+		// After the JSON, which the plugin reads first.
+		res.Content = append(res.Content, mcp.NewTextContent(resolved.Hint))
+	}
+	return res, err
 }
 
 // VersionInfo is the rune_version result.
