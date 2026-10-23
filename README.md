@@ -23,6 +23,22 @@ In Claude Code, started from a Rune terminal:
 /plugin install rune@unstablebuild
 ```
 
+## Use
+
+| Where | What | Does |
+| --- | --- | --- |
+| Rune's console | `claude` | Starts Claude Code in a new terminal tab, connected to this workspace. |
+| Rune's console | `claudesend` | Mentions the focused file, and the selected lines if any, in Claude Code's prompt. |
+| Claude Code | `/rune-diagnostics` | Shows or hides a pane of the workspace's diagnostics, refreshed after each turn. |
+| Claude Code | `@pkg.Symbol` | Attaches the file that defines the symbol. Tab completes qualified names. |
+
+Edits Claude Code proposes open in Rune as a diff in a floating window,
+highlighted like the editor. Its Accept, Reject and Edit buttons, or `a`,
+`r` and `e`, answer it; Left and Right, `C-h` and `C-l`, or `C-b` and
+`C-f` select a button and Enter presses it. After Edit, saving accepts
+the edited proposal. `]` and `[` jump between changes, and `q` leaves
+the answer to the terminal.
+
 See the [Claude Code guide](https://docs.rune.build/agent/claude-code) for
 everything the integration does.
 

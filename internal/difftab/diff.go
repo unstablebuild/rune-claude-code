@@ -15,14 +15,20 @@
 package difftab
 
 import (
-	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-// contextLines is the number of unchanged lines shown around a change.
-const contextLines = 3
+// minContext is the fewest unchanged lines a review shows around a
+// change; it shows more when its window has room for them.
+const minContext = 5
+
+// minCommon is the share of a replaced line that must be unchanged for
+// the words that changed in it to be marked; below it the two lines are
+// simply different.
+const minCommon = 0.4
 
 type lineKind uint8
 
@@ -30,26 +36,36 @@ const (
 	lineEqual lineKind = iota
 	lineDelete
 	lineInsert
-	lineHunk
+	// lineFold stands for unchanged lines the diff leaves out.
+	lineFold
 )
 
-// line is one row of a unified diff. Old and New are 1-based line
-// numbers, zero when the line is not on that side.
+// line is one row of the diff. Old and New are 1-based line numbers,
+// zero when the line is not on that side; those of a lineFold are the
+// first lines it hides, and folded is how many. Changed are the rune
+// ranges of a deleted or inserted line that differ from the line it
+// replaces.
 type line struct {
 	kind     lineKind
 	old, new int
 	text     string
+	folded   int
+	changed  []span
 }
 
-// diffLines returns the unified diff of oldText and newText, with
-// contextLines of context around each change and a lineHunk header
-// before each hunk.
-func diffLines(oldText, newText string) []line {
+// span is the rune range [from, to) of a line.
+type span struct{ from, to int }
+
+// diffAll returns every line of the diff of oldText and newText, with
+// the words that changed in replaced lines marked. It is empty when the
+// texts have the same lines.
+func diffAll(oldText, newText string) []line {
 	dmp := diffmatchpatch.New()
 	a, b, table := dmp.DiffLinesToRunes(oldText, newText)
 	diffs := dmp.DiffCharsToLines(dmp.DiffMainRunes(a, b, false), table)
 
 	var all []line
+	changed := false
 	o, n := 1, 1
 	for _, d := range diffs {
 		for _, t := range splitLines(d.Text) {
@@ -61,60 +77,96 @@ func diffLines(oldText, newText string) []line {
 			case diffmatchpatch.DiffDelete:
 				all = append(all, line{kind: lineDelete, old: o, text: t})
 				o++
+				changed = true
 			case diffmatchpatch.DiffInsert:
 				all = append(all, line{kind: lineInsert, new: n, text: t})
 				n++
+				changed = true
 			}
 		}
 	}
+	if !changed {
+		return nil
+	}
+	markChanges(all)
+	return all
+}
 
+// fold returns all with each change and context unchanged lines around
+// it, and a lineFold for each run of more than one unchanged line left
+// out.
+func fold(all []line, context int) []line {
 	keep := make([]bool, len(all))
 	for i, l := range all {
 		if l.kind == lineEqual {
 			continue
 		}
-		for j := max(0, i-contextLines); j <= min(len(all)-1, i+contextLines); j++ {
+		for j := max(0, i-context); j <= min(len(all)-1, i+context); j++ {
 			keep[j] = true
 		}
 	}
 	var out []line
 	for i := 0; i < len(all); {
-		if !keep[i] {
-			i++
-			continue
-		}
 		j := i
-		for j < len(all) && keep[j] {
+		for j < len(all) && keep[j] == keep[i] {
 			j++
 		}
-		out = append(out, hunkHeader(all[i:j]))
-		out = append(out, all[i:j]...)
+		// A fold of one line would take the row the line takes.
+		if keep[i] || j-i == 1 {
+			out = append(out, all[i:j]...)
+		} else {
+			out = append(out, line{kind: lineFold, old: all[i].old, new: all[i].new, folded: j - i})
+		}
 		i = j
 	}
 	return out
 }
 
-// hunkHeader returns the "@@ -l,s +l,s @@" header of hunk.
-func hunkHeader(hunk []line) line {
-	var oldStart, oldCount, newStart, newCount int
-	for _, l := range hunk {
-		if l.old > 0 {
-			if oldCount == 0 {
-				oldStart = l.old
-			}
-			oldCount++
+// markChanges sets the changed spans of each deleted line and of the
+// inserted line that replaces it, pairing a run of deletions with the
+// run of insertions right after it, line by line.
+func markChanges(lines []line) {
+	for i := 0; i < len(lines); {
+		d := i
+		for d < len(lines) && lines[d].kind == lineDelete {
+			d++
 		}
-		if l.new > 0 {
-			if newCount == 0 {
-				newStart = l.new
-			}
-			newCount++
+		n := d
+		for n < len(lines) && lines[n].kind == lineInsert {
+			n++
+		}
+		for k := range min(d-i, n-d) {
+			lines[i+k].changed, lines[d+k].changed = changedSpans(lines[i+k].text, lines[d+k].text)
+		}
+		i = max(n, i+1)
+	}
+}
+
+// changedSpans returns the rune ranges of oldText and of newText that
+// differ, or none when too little of them is the same.
+func changedSpans(oldText, newText string) (oldSpans, newSpans []span) {
+	dmp := diffmatchpatch.New()
+	diffs := dmp.DiffCleanupSemantic(dmp.DiffMain(oldText, newText, false))
+	var common, o, n int
+	for _, d := range diffs {
+		size := utf8.RuneCountInString(d.Text)
+		switch d.Type {
+		case diffmatchpatch.DiffEqual:
+			common += size
+			o += size
+			n += size
+		case diffmatchpatch.DiffDelete:
+			oldSpans = append(oldSpans, span{o, o + size})
+			o += size
+		case diffmatchpatch.DiffInsert:
+			newSpans = append(newSpans, span{n, n + size})
+			n += size
 		}
 	}
-	return line{
-		kind: lineHunk,
-		text: fmt.Sprintf("@@ -%d,%d +%d,%d @@", oldStart, oldCount, newStart, newCount),
+	if float64(common) < minCommon*float64(max(o, n)) {
+		return nil, nil
 	}
+	return oldSpans, newSpans
 }
 
 // splitLines splits text into lines without their line endings.

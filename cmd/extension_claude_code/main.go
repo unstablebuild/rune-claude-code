@@ -93,19 +93,24 @@ func (e *extension) ExtendWorkspace(
 		Root:          root,
 	}
 
+	parser := ws.Parser(ctx)
+
 	ide := idetools.New(ideDeps)
 	diffs := difftab.New(difftab.Deps{
 		WindowManager: wm,
 		Opener:        ideDeps.Opener,
 		FileSystem:    fs,
 		Interrupter:   ws.Interrupter(ctx),
+		Editor:        editor,
+		Parser:        parser,
+		Theme:         difftab.ThemeFrom(ws.Config(ctx)),
 		Root:          root.Path(),
 	})
 	diffs.Register(ide.Server())
 	e.onClose(diffs.Close)
 	t := tools.New(ctx, tools.Deps{
 		IDE:           ideDeps,
-		Parser:        ws.Parser(ctx),
+		Parser:        parser,
 		Notifications: ws.Notifications(ctx),
 	})
 

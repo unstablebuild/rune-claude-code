@@ -13,9 +13,9 @@
 // limitations under the License.
 
 // Package difftab shows the edits Claude Code proposes as diffs in
-// Rune, next to the focused window, and returns the user's decision.
-// It never writes the edited file; Claude Code does once the edit is
-// accepted.
+// Rune, in a floating window drawn like Rune's editor, and returns the
+// user's decision. It never writes the edited file; Claude Code does
+// once the edit is accepted.
 package difftab
 
 import (
@@ -31,19 +31,29 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
+	"github.com/unstablebuild/rune-go-sdk/api/syntaxapi"
 	"github.com/unstablebuild/rune-go-sdk/api/textapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
+	"github.com/unstablebuild/rune-go-sdk/component"
 	"github.com/unstablebuild/rune-go-sdk/term"
 
 	"github.com/unstablebuild/rune-claude-code/internal/ideserver"
 )
 
+// highlightWait is how long a diff waits for its syntax highlighting
+// before it shows without it; the highlighting is drawn once it
+// arrives.
+const highlightWait = 250 * time.Millisecond
+
 // Events are the editor events Manager.Handle expects.
-var Events = []textapi.EventType{textapi.EventTypeFlush, textapi.EventTypeClose}
+var Events = []textapi.EventType{
+	textapi.EventTypeFlush, textapi.EventTypeClose, textapi.EventTypeEdit,
+}
 
 // Deps are the workspace services the diff reviews use.
 type Deps struct {
@@ -51,6 +61,14 @@ type Deps struct {
 	Opener        browserapi.ResourceOpener
 	FileSystem    workspaceapi.FileSystem
 	Interrupter   term.Interrupter
+	// Editor puts the cursor on the first change of a proposal opened
+	// to edit, and marks its changes; without one it does neither.
+	Editor textapi.Editor
+	// Parser highlights the diffs' syntax; without one they are not.
+	Parser syntaxapi.Parser
+	// Theme is what the diffs are drawn with. It defaults to
+	// DefaultTheme.
+	Theme Theme
 	// Root is the workspace root path, which titles are relative to.
 	Root string
 	// TempDir is where proposed contents are written for the user to
@@ -76,6 +94,9 @@ var _ textapi.EventHandler = (*Manager)(nil)
 func New(deps Deps) *Manager {
 	if deps.TempDir == "" {
 		deps.TempDir = os.TempDir()
+	}
+	if deps.Theme == (Theme{}) {
+		deps.Theme = DefaultTheme
 	}
 	return &Manager{
 		deps:    deps,
@@ -122,12 +143,17 @@ func (m *Manager) openDiff(
 	if args.NewFilePath == "" || args.TabName == "" {
 		return mcp.NewToolResultError("new_file_path and tab_name are required"), nil
 	}
-	old, err := m.read(args.OldFilePath)
+	old, exists, err := m.read(args.OldFilePath)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	r := newReview(args.TabName, args.NewFilePath, m.title(args.NewFilePath),
-		old, args.NewFileContents, m.edit)
+	verb := "edit"
+	if !exists {
+		verb = "create"
+	}
+	title := fmt.Sprintf("Claude Code wants to %s %s", verb, m.title(args.NewFilePath))
+	r := newReview(args.TabName, args.NewFilePath, title, old,
+		args.NewFileContents, m.deps.Theme, m.edit)
 
 	m.mu.Lock()
 	prev := m.reviews[r.name]
@@ -138,6 +164,10 @@ func (m *Manager) openDiff(
 	}
 	defer m.forget(r)
 
+	select {
+	case <-m.highlight(r, old):
+	case <-time.After(highlightWait):
+	}
 	if err := m.show(r); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -145,6 +175,7 @@ func (m *Manager) openDiff(
 
 	select {
 	case blocks := <-r.done:
+		slog.Info("diff answered", "path", r.path, "answer", blocks[0])
 		content := make([]mcp.Content, len(blocks))
 		for i, b := range blocks {
 			content[i] = mcp.NewTextContent(b)
@@ -155,22 +186,58 @@ func (m *Manager) openDiff(
 	}
 }
 
-// read returns the contents of path, or nothing if it does not exist
-// yet.
-func (m *Manager) read(path string) (string, error) {
+// read returns the contents of path and whether it exists; nothing if
+// it does not exist yet.
+func (m *Manager) read(path string) (string, bool, error) {
 	f, err := m.deps.FileSystem.OpenFile(path, os.O_RDONLY, 0)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", nil
+		return "", false, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("open %s: %w", path, err)
+		return "", false, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 	b, err := io.ReadAll(f)
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", path, err)
+		return "", false, fmt.Errorf("read %s: %w", path, err)
 	}
-	return string(b), nil
+	return string(b), true, nil
+}
+
+// highlight asks Rune for the syntax highlighting of r's lines, in the
+// background, and redraws r with it. The channel it returns is closed
+// once it is done, whether it found any or not.
+func (m *Manager) highlight(r *review, old string) <-chan struct{} {
+	done := make(chan struct{})
+	if m.deps.Parser == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		uri, err := m.deps.FileSystem.URI(r.path)
+		if err != nil {
+			slog.Debug("highlight diff", "path", r.path, "error", err)
+			return
+		}
+		ctx := context.Background()
+		oldHL, err := highlight(ctx, m.deps.Parser, uri, old)
+		if err != nil {
+			slog.Debug("highlight diff", "path", r.path, "error", err)
+		}
+		newHL, err := highlight(ctx, m.deps.Parser, uri, r.proposed)
+		if err != nil {
+			slog.Debug("highlight diff", "path", r.path, "error", err)
+		}
+		if oldHL == nil && newHL == nil {
+			return
+		}
+		r.setHighlights(oldHL, newHL)
+		if err := m.deps.Interrupter.Interrupt(ctx); err != nil {
+			slog.Debug("redraw diff", "error", err)
+		}
+	}()
+	return done
 }
 
 func (m *Manager) title(path string) string {
@@ -181,13 +248,13 @@ func (m *Manager) title(path string) string {
 	return path
 }
 
-// show opens r in a window to the right of the focused one.
+// show opens r in a floating window centered over Rune's, which takes
+// the size r asks for as far as Rune's leaves room.
 func (m *Manager) show(r *review) error {
-	focus, err := m.deps.WindowManager.Focus()
-	if err != nil {
-		return fmt.Errorf("focused window: %w", err)
-	}
-	win, err := m.deps.WindowManager.Split(browserapi.OrientationRight, focus, r)
+	win, err := m.deps.WindowManager.Floating(r, browserapi.FloatingConfig{
+		Alignment: component.AlignmentCentered,
+		Title:     r.title,
+	})
 	if err != nil {
 		return fmt.Errorf("open diff: %w", err)
 	}
@@ -255,7 +322,7 @@ func (m *Manager) closeAll(
 }
 
 // edit writes r's proposal to a temporary file and opens it in r's
-// window. Saving the file accepts its contents.
+// window, which keeps its size. Saving the file accepts its contents.
 func (m *Manager) edit(r *review) {
 	if err := m.startEdit(r); err != nil {
 		r.editFailed(err)
@@ -299,6 +366,7 @@ func (m *Manager) startEdit(r *review) error {
 		m.removeEdit(path)
 		return err
 	}
+	m.annotate(r, uri)
 	return nil
 }
 
@@ -322,8 +390,9 @@ func (m *Manager) removeEdit(path string) {
 	}
 }
 
-// Handle accepts an edited proposal when the user saves it, and
-// removes it once its buffer is closed.
+// Handle accepts an edited proposal when the user saves it, marks its
+// changes again as it is edited, and removes it once its buffer is
+// closed.
 func (m *Manager) Handle(_ context.Context, ev textapi.Event) bool {
 	path := ev.URI.Path()
 	m.mu.Lock()
@@ -336,9 +405,14 @@ func (m *Manager) Handle(_ context.Context, ev textapi.Event) bool {
 		return false
 	}
 	switch ev.Type {
+	case textapi.EventTypeEdit:
+		m.remark(r, ev.URI)
 	case textapi.EventTypeFlush:
+		r.stopRemark()
 		r.resolve(ideserver.DiffFileSaved, ev.Content)
 	case textapi.EventTypeClose:
+		r.stopRemark()
+		slog.Info("edited proposal closed", "path", r.path)
 		m.removeEdit(path)
 	}
 	return false

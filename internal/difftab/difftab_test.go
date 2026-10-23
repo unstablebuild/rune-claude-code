@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"strings"
@@ -30,8 +31,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
+	"github.com/unstablebuild/rune-go-sdk/api/config"
+	"github.com/unstablebuild/rune-go-sdk/api/syntaxapi"
 	"github.com/unstablebuild/rune-go-sdk/api/textapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
+	"github.com/unstablebuild/rune-go-sdk/component"
+	"github.com/unstablebuild/rune-go-sdk/iterator"
 	"github.com/unstablebuild/rune-go-sdk/term"
 
 	"github.com/unstablebuild/rune-claude-code/internal/ideserver"
@@ -40,35 +45,107 @@ import (
 const target = "/ws/pkg/main.go"
 
 func TestDiffLines(t *testing.T) {
+	diffLines := func(a, b string) []line { return fold(diffAll(a, b), 3) }
 	old := "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"
 	proposed := "1\nTWO\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n"
-	r := &review{gutter: 2}
-	var got []string
-	for _, l := range diffLines(old, proposed) {
-		s, _ := r.format(l)
-		got = append(got, s)
-	}
 	assert.Equal(t, []string{
-		" @@ -1,5 +1,5 @@",
-		"  1  1   1",
-		"  2    - 2",
-		"     2 + TWO",
-		"  3  3   3",
-		"  4  4   4",
-		"  5  5   5",
-		" @@ -10,3 +10,4 @@",
-		" 10 10   10",
-		" 11 11   11",
-		" 12 12   12",
-		"    13 + 13",
-	}, got)
+		"  1 1 1",
+		"- 2 . 2",
+		"+ . 2 TWO",
+		"  3 3 3",
+		"  4 4 4",
+		"  5 5 5",
+		"⋯ 6 6 4",
+		"  10 10 10",
+		"  11 11 11",
+		"  12 12 12",
+		"+ . 13 13",
+	}, describe(diffLines(old, proposed)))
 
 	assert.Empty(t, diffLines("same\n", "same\n"))
 
-	newFile := diffLines("", "a\n\nb")
-	require.Len(t, newFile, 4)
-	assert.Equal(t, "@@ -0,0 +1,3 @@", newFile[0].text)
-	assert.Equal(t, line{kind: lineInsert, new: 2, text: ""}, newFile[2])
+	assert.Equal(t, []string{"+ . 1 a", "+ . 2 ", "+ . 3 b"}, describe(diffLines("", "a\n\nb")))
+
+	// Unchanged lines before the first change fold too.
+	assert.Equal(t, []string{
+		"⋯ 1 1 6", "  7 7 g", "  8 8 h", "  9 9 i", "- 10 . j", "+ . 10 J",
+	}, describe(diffLines("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n", "a\nb\nc\nd\ne\nf\ng\nh\ni\nJ\n")))
+
+	// One unchanged line between two changes is shown rather than folded.
+	got := diffLines("1\n2\n3\n4\n5\n6\n7\n8\n9\n", "ONE\n2\n3\n4\n5\n6\n7\n8\nNINE\n")
+	require.Len(t, got, 11)
+	assert.Equal(t, "  5 5 5", describe(got)[5])
+}
+
+func TestChangedSpans(t *testing.T) {
+	lines := diffAll("x := 1\ny\n", "x := 2\ny\n")
+	require.Len(t, lines, 3)
+	assert.Equal(t, []span{{5, 6}}, lines[0].changed)
+	assert.Equal(t, []span{{5, 6}}, lines[1].changed)
+
+	o, n := changedSpans("return a + b", "return a - b")
+	assert.Equal(t, []span{{9, 10}}, o)
+	assert.Equal(t, []span{{9, 10}}, n)
+
+	o, n = changedSpans("foo", "bar")
+	assert.Nil(t, o, "lines with too little in common are not marked")
+	assert.Nil(t, n)
+}
+
+func TestChangeLocations(t *testing.T) {
+	added, deleted := changeLocations(diffAll("a\nb\nc\nd\ne\n", "a\nB\nB2\nc\nd\n"), DefaultTheme)
+	assert.Equal(t, []textapi.Location{{
+		From: term.Coordinates{Y: 1}, To: term.Coordinates{Y: 3}, Attr: DefaultTheme.InsertMark, Icon: "+",
+	}}, added)
+	assert.Equal(t, []textapi.Location{{
+		From: term.Coordinates{Y: 1}, To: term.Coordinates{Y: 1, X: 1}, Attr: DefaultTheme.DeleteMark, Icon: "-",
+		Message: "Deleted: b",
+	}, {
+		From: term.Coordinates{Y: 4}, To: term.Coordinates{Y: 4, X: 1}, Attr: DefaultTheme.DeleteMark, Icon: "-",
+		Message: "Deleted: e",
+	}}, deleted, "a deletion at the end is marked on the last line")
+
+	_, deleted = changeLocations(diffAll("a\n  b\nc\nd\n", "a\nd\n"), DefaultTheme)
+	assert.Equal(t, []textapi.Location{{
+		From: term.Coordinates{Y: 1}, To: term.Coordinates{Y: 1, X: 1}, Attr: DefaultTheme.DeleteMark, Icon: "-",
+		Message: "Deleted 2 lines: b …",
+	}}, deleted, "on the line after it")
+}
+
+func TestCellsText(t *testing.T) {
+	assert.Equal(t, "a\tb\n\nc\n", cellsText(cells("a\tb\n\nc"), true))
+	assert.Equal(t, "a\nb", cellsText(cells("a\nb"), false))
+	assert.Equal(t, "a\nb\n", cellsText(cells("a\nb\n"), true), "a last empty row is the line break")
+}
+
+// cells lays text out as an editor's cells, one row per line.
+func cells(text string) [][]term.Cell {
+	var rows [][]term.Cell
+	for _, l := range strings.Split(text, "\n") {
+		row := []term.Cell{}
+		for _, ch := range l {
+			row = append(row, term.NewCell(ch, 1, term.Attributes{}))
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func describe(lines []line) []string {
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		switch l.kind {
+		case lineEqual:
+			out = append(out, fmt.Sprintf("  %d %d %s", l.old, l.new, l.text))
+		case lineDelete:
+			out = append(out, fmt.Sprintf("- %d . %s", l.old, l.text))
+		case lineInsert:
+			out = append(out, fmt.Sprintf("+ . %d %s", l.new, l.text))
+		case lineFold:
+			out = append(out, fmt.Sprintf("⋯ %d %d %d", l.old, l.new, l.folded))
+		}
+	}
+	return out
 }
 
 func TestOpenDiffAnswers(t *testing.T) {
@@ -141,6 +218,25 @@ func TestOpenDiffEdit(t *testing.T) {
 	assert.True(t, strings.HasPrefix(path.Path(), "/tmp/claude-review-"), path.Path())
 	assert.True(t, strings.HasSuffix(path.Path(), "/main.go"), path.Path())
 	assert.Equal(t, "package main\n// proposed\n", f.fs.get(path.Path()))
+	require.Eventually(t, func() bool { return len(f.editor.cursors(opened)) > 0 }, 5*time.Second, time.Millisecond)
+	assert.Equal(t, []term.Coordinates{{Y: 1}}, f.editor.cursors(opened), "the cursor is on the change")
+	assert.Equal(t, []textapi.Location{{
+		From: term.Coordinates{Y: 1}, To: term.Coordinates{Y: 2}, Attr: DefaultTheme.InsertMark, Icon: "+",
+	}}, f.editor.locations(opened, addedID), "the inserted line is marked")
+	assert.Empty(t, f.editor.locations(opened, deletedID))
+
+	// Rune drops the marks on every edit; they are set again, for what
+	// the proposal is now.
+	f.fs.put(path.Path(), "// edited\n")
+	f.mgr.Handle(context.Background(), textapi.Event{Type: textapi.EventTypeEdit, URI: path})
+	require.Eventually(t, func() bool { return len(f.editor.locations(opened, deletedID)) > 0 }, 5*time.Second, time.Millisecond)
+	assert.Equal(t, []textapi.Location{{
+		From: term.Coordinates{}, To: term.Coordinates{X: 1}, Attr: DefaultTheme.DeleteMark, Icon: "-",
+		Message: "Deleted: package main",
+	}}, f.editor.locations(opened, deletedID))
+	assert.Equal(t, []textapi.Location{{
+		From: term.Coordinates{}, To: term.Coordinates{Y: 1}, Attr: DefaultTheme.InsertMark, Icon: "+",
+	}}, f.editor.locations(opened, addedID))
 
 	// Other buffers are ignored.
 	f.mgr.Handle(context.Background(), textapi.Event{
@@ -195,42 +291,270 @@ func TestOpenDiffSameTabName(t *testing.T) {
 	assert.Equal(t, []string{ideserver.DiffRejected}, texts(t, <-second))
 }
 
+// footer is the fixture's bottom bar at width 66, which its window asks for.
+const footer = " +1 -0   q answers in the terminal   Accept     Reject     Edit"
+
 func TestReviewDraw(t *testing.T) {
 	f := newFixture(t)
 	_, r := f.openDiff(t, context.Background())
-	r.Resize(40, 6)
-	assert.Equal(t, strings.Join([]string{
-		" Claude Code wants to edit pkg/main.go",
-		" a accept   r reject   e edit, then save",
-		strings.Repeat("─", 40),
-		" @@ -1,1 +1,2 @@",
-		" 1 1   package main",
-		"   2 + // proposed",
-	}, "\n"), f.screen(r))
+	w, h := r.Dimensions()
+	assert.Equal(t, []int{editColumns + 1 + 1 + editChrome, minHeight}, []int{w, h},
+		"room for 90 columns of text in the editor, beside its gutter")
+	assert.Equal(t, "Claude Code wants to edit pkg/main.go", f.wm.lastConfig().Title)
+	assert.Equal(t, component.AlignmentCentered, f.wm.lastConfig().Alignment)
 
-	// Two rows for three lines of diff.
-	r.Resize(40, 5)
+	r.Resize(66, 4)
+	s := f.draw(r)
+	assert.Equal(t, strings.Join([]string{
+		"  1 package main",
+		"+ 2 // proposed",
+		strings.Repeat("─", 66),
+		footer,
+	}, "\n"), s.String(66, 4))
+	assert.Equal(t, DefaultTheme.Insert.Bg, s.at(4, 1).Bg, "inserted lines are tinted")
+	assert.Equal(t, DefaultTheme.Insert.Bg, s.at(60, 1).Bg, "to the window's edge")
+	assert.False(t, s.at(4, 0).Bg.Valid(), "unchanged lines are not")
+	assert.Equal(t, DefaultTheme.LineNumber.Fg, s.at(2, 0).Fg)
+	assert.Equal(t, DefaultTheme.Selected.Bg, s.at(37, 3).Bg, "accept is selected first")
+	assert.Equal(t, DefaultTheme.Button.Bg, s.at(48, 3).Bg)
+	assert.NotZero(t, s.at(37, 3).Attrs&term.AttrUnderline, "a button's key is underlined")
+	assert.Zero(t, s.at(38, 3).Attrs&term.AttrUnderline)
+
+	// One row for two lines of diff.
+	r.Resize(66, 3)
 	press(t, r, 'j', false)
-	assert.True(t, strings.HasSuffix(f.screen(r), "─\n 1 1   package main\n   2 + // proposed"))
+	assert.True(t, strings.HasPrefix(f.screen(r), "+ 2 // proposed\n"))
 	press(t, r, 'j', false)
-	assert.True(t, strings.HasSuffix(f.screen(r), "─\n 1 1   package main\n   2 + // proposed"))
+	assert.True(t, strings.HasPrefix(f.screen(r), "+ 2 // proposed\n"))
 	press(t, r, 'g', false)
-	assert.True(t, strings.HasSuffix(f.screen(r), "─\n @@ -1,1 +1,2 @@\n 1 1   package main"))
+	assert.True(t, strings.HasPrefix(f.screen(r), "  1 package main\n"))
 	press(t, r, 'G', false)
-	assert.True(t, strings.HasSuffix(f.screen(r), "─\n 1 1   package main\n   2 + // proposed"))
+	assert.True(t, strings.HasPrefix(f.screen(r), "+ 2 // proposed\n"))
+
+	// Long lines scroll sideways, the gutter stays.
+	r.Resize(10, 4)
+	press(t, r, 'l', false)
+	assert.True(t, strings.HasPrefix(f.screen(r), "  1 age ma\n+ 2 ropose\n"), f.screen(r))
+	press(t, r, 'h', false)
+	assert.True(t, strings.HasPrefix(f.screen(r), "  1 packag\n"))
 
 	exit, handled := r.Handle(term.Event{Type: term.EventKey, Ch: 'a', Mod: term.ModCtrl})
 	assert.False(t, exit || handled, "modified keys are left to Rune")
 }
 
+func TestReviewDimensions(t *testing.T) {
+	long := strings.Repeat("x", 200)
+	r := newReview("t", target, "title", "a\n", long+"\n\tb\n", DefaultTheme, nil)
+	w, h := r.Dimensions()
+	assert.Equal(t, 2+editChrome+200, w, "long lines widen the window")
+	assert.Equal(t, minHeight, h)
+
+	old := strings.Repeat("line\n", 100)
+	r = newReview("t", target, "title", old, old+"more\n", DefaultTheme, nil)
+	_, h = r.Dimensions()
+	assert.Equal(t, 101+footerRows, h, "every line of the diff, unfolded")
+
+	r = newReview("t", target, "title", "", "\t\t\tx\n", DefaultTheme, nil)
+	assert.Equal(t, 13, r.textWidth, "tabs take TabSpaces cells")
+}
+
+func TestReviewButtons(t *testing.T) {
+	f := newFixture(t)
+	res, r := f.openDiff(t, context.Background())
+	r.Resize(66, 4)
+	mouse := func(key term.Key, x, y int) (bool, bool) {
+		return r.Handle(term.Event{Type: term.EventMouse, Key: key, MouseX: x, MouseY: y})
+	}
+
+	// The pointer selects the button under it, and only that one.
+	_, handled := mouse(0, 50, 3)
+	assert.True(t, handled)
+	s := f.draw(r)
+	assert.Equal(t, DefaultTheme.Selected.Bg, s.at(48, 3).Bg)
+	assert.Equal(t, DefaultTheme.Button.Bg, s.at(37, 3).Bg)
+	mouse(0, 50, 99)
+	assert.Equal(t, DefaultTheme.Selected.Bg, f.draw(r).at(48, 3).Bg, "the selection stays when it leaves")
+	mouse(0, 20, 3)
+	assert.Equal(t, 1, r.selected, "and when it moves off the buttons")
+
+	// Dragging off a button does not press it.
+	mouse(term.MouseLeft, 50, 3)
+	mouse(term.MouseLeft, 20, 3)
+	exit, _ := mouse(term.MouseRelease, 20, 3)
+	assert.False(t, exit)
+	// Nor does releasing on one the mouse did not go down on.
+	mouse(term.MouseLeft, 20, 1)
+	exit, _ = mouse(term.MouseRelease, 40, 3)
+	assert.False(t, exit)
+
+	mouse(term.MouseLeft, 40, 3)
+	exit, handled = mouse(term.MouseRelease, 40, 3)
+	assert.True(t, exit && handled)
+	assert.Equal(t, []string{ideserver.DiffTabClosed}, texts(t, <-res))
+	f.fs.assertUntouched(t)
+}
+
+func TestReviewSelect(t *testing.T) {
+	f := newFixture(t)
+	res, r := f.openDiff(t, context.Background())
+	r.Resize(66, 4)
+	key := func(ev term.Event) bool {
+		t.Helper()
+		ev.Type = term.EventKey
+		exit, handled := r.Handle(ev)
+		assert.False(t, exit)
+		return handled
+	}
+	ctrl := func(ch rune) term.Event { return term.Event{Ch: ch, Mod: term.ModCtrl} }
+
+	assert.Equal(t, 0, r.selected, "accept is selected first")
+	assert.False(t, key(term.Event{Key: term.KeyArrowLeft}), "the first button leaves Left to Rune")
+	assert.True(t, key(term.Event{Key: term.KeyArrowRight}))
+	assert.Equal(t, 1, r.selected)
+	assert.True(t, key(ctrl('l')))
+	assert.Equal(t, 2, r.selected)
+	assert.False(t, key(ctrl('f')), "the last button leaves Ctrl-f to Rune")
+	assert.Equal(t, 2, r.selected)
+	assert.True(t, key(ctrl('b')))
+	assert.True(t, key(ctrl('h')))
+	assert.Equal(t, 0, r.selected)
+	assert.True(t, key(ctrl('f')))
+	s := f.draw(r)
+	assert.Equal(t, DefaultTheme.Button.Bg, s.at(37, 3).Bg)
+	assert.Equal(t, DefaultTheme.Selected.Bg, s.at(48, 3).Bg)
+	assert.Equal(t, DefaultTheme.Button.Bg, s.at(59, 3).Bg)
+	assert.False(t, key(ctrl('x')), "other Ctrl keys are Rune's")
+
+	exit, handled := r.Handle(term.Event{Type: term.EventKey, Key: term.KeyEnter})
+	assert.True(t, exit && handled, "Enter presses the selected button")
+	assert.Equal(t, []string{ideserver.DiffRejected}, texts(t, <-res))
+}
+
+func TestReviewRejectButton(t *testing.T) {
+	f := newFixture(t)
+	res, r := f.openDiff(t, context.Background())
+	r.Resize(66, 4)
+	r.Handle(term.Event{Type: term.EventMouse, Key: term.MouseLeft, MouseX: 50, MouseY: 3})
+	exit, _ := r.Handle(term.Event{Type: term.EventMouse, Key: term.MouseRelease, MouseX: 51, MouseY: 3})
+	assert.True(t, exit)
+	assert.Equal(t, []string{ideserver.DiffRejected}, texts(t, <-res))
+}
+
+func TestReviewHighlight(t *testing.T) {
+	f := newFixture(t)
+	purple := term.Attributes{Fg: term.ColorPurple, Attrs: term.AttrBold, Bg: term.ColorBlue}
+	f.parser.locs = map[string][]textapi.Location{
+		"package main\n": {{From: term.Coordinates{}, To: term.Coordinates{X: 7}, Attr: purple}},
+		"package main\n// proposed\n": {
+			{From: term.Coordinates{}, To: term.Coordinates{X: 7}, Attr: purple},
+			// A comment that runs to the end of the text.
+			{From: term.Coordinates{Y: 1}, To: term.Coordinates{Y: 2}, Attr: term.Attributes{Fg: term.ColorYellow}},
+		},
+	}
+	_, r := f.openDiff(t, context.Background())
+	r.Resize(66, 4)
+	s := f.draw(r)
+	assert.Equal(t, term.ColorPurple, s.at(4, 0).Fg)
+	assert.NotZero(t, s.at(4, 0).Attrs&term.AttrBold)
+	assert.False(t, s.at(4, 0).Bg.Valid(), "highlights keep the line's background")
+	assert.Equal(t, term.ColorDefault, s.at(11, 0).Fg)
+	assert.Equal(t, term.ColorYellow, s.at(4, 1).Fg)
+	assert.Equal(t, term.ColorYellow, s.at(14, 1).Fg)
+	assert.Equal(t, DefaultTheme.Insert.Bg, s.at(4, 1).Bg)
+	assert.Equal(t, []string{"file:///ws/pkg/main.go", "file:///ws/pkg/main.go"}, f.parser.uris())
+}
+
+func TestReviewJump(t *testing.T) {
+	old := "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n"
+	proposed := strings.Replace(strings.Replace(old, "\n2\n", "\nTWO\n", 1), "\n18\n", "\nEIGHTEEN\n", 1)
+	r := newReview("t", target, "title", old, proposed, DefaultTheme, nil)
+	r.Resize(66, 4+footerRows)
+	require.Equal(t, []int{1, 14}, r.changes)
+	press(t, r, ']', false)
+	assert.Equal(t, 11, r.offset)
+	press(t, r, ']', false)
+	assert.Equal(t, 11, r.offset, "no change below")
+	press(t, r, '[', false)
+	assert.Equal(t, 0, r.offset)
+}
+
+func TestReviewLayout(t *testing.T) {
+	old := "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n"
+	proposed := strings.Replace(strings.Replace(old, "\n2\n", "\nTWO\n", 1), "\n18\n", "\nEIGHTEEN\n", 1)
+	r := newReview("t", target, "title", old, proposed, DefaultTheme, nil)
+	folds := func() int {
+		n := 0
+		for _, l := range r.lines {
+			if l.kind == lineFold {
+				n++
+			}
+		}
+		return n
+	}
+
+	r.Resize(66, 22+footerRows)
+	assert.Len(t, r.lines, 22, "a window with room for the whole diff folds nothing")
+	assert.Zero(t, folds())
+
+	r.Resize(66, 20+footerRows)
+	assert.Len(t, r.lines, 20, "a shorter one folds what does not fit")
+	assert.Equal(t, 1, folds())
+
+	r.Resize(66, 10+footerRows)
+	assert.Len(t, r.lines, 18, "and keeps minContext lines around each change")
+	assert.Equal(t, 1, folds())
+}
+
+func TestReviewClosedFromBar(t *testing.T) {
+	f := newFixture(t)
+	res, r := f.openDiff(t, context.Background())
+	require.NoError(t, r.Close())
+	callTool(t, f.srv, "close_tab", map[string]any{"tab_name": r.name})
+	assert.Equal(t, []string{ideserver.DiffTabClosed}, texts(t, <-res))
+	assert.Empty(t, f.wm.closedIDs(), "the window is gone already")
+}
+
 func TestNewFileTitle(t *testing.T) {
 	f := newFixture(t)
 	res, r := f.openDiff(t, context.Background(), "/elsewhere/new.go")
-	r.Resize(60, 5)
-	assert.Contains(t, f.screen(r), "wants to edit /elsewhere/new.go")
-	assert.Contains(t, f.screen(r), "@@ -0,0 +1,2 @@")
+	assert.Equal(t, "Claude Code wants to create /elsewhere/new.go", f.wm.lastConfig().Title)
+	r.Resize(66, 4)
+	assert.True(t, strings.HasPrefix(f.screen(r), "+ 1 package main\n+ 2 // proposed\n"), f.screen(r))
 	press(t, r, 'a', true)
 	<-res
+}
+
+func TestThemeFrom(t *testing.T) {
+	cfg := config.MapConfig(map[string]any{
+		"editor": map[string]any{
+			"mode":      "modeless",
+			"tabspaces": 2,
+			"standard":  map[string]any{"attr": map[string]any{"bg": "#101010"}},
+			"vim":       map[string]any{"attr": map[string]any{"bg": "#202020"}},
+			"aux_bar":   map[string]any{"line_number_attr": map[string]any{"fg": "silver"}},
+		},
+		"browser": map[string]any{
+			"prompt": map[string]any{
+				"text_attr":      map[string]any{"bg": "navy"},
+				"highlight_attr": map[string]any{"bg": "teal", "flag": "bold"},
+			},
+		},
+	})
+	got := ThemeFrom(cfg)
+	assert.Equal(t, 2, got.TabSpaces)
+	assert.Equal(t, term.Attributes{Bg: term.NewHexColor(0x101010)}, got.Text, "the standard editor's")
+	assert.Equal(t, term.Attributes{Bg: term.GetColor("navy")}, got.Button)
+	assert.Equal(t, term.Attributes{Fg: term.GetColor("silver")}, got.LineNumber)
+	assert.Equal(t, term.Attributes{Bg: term.GetColor("teal"), Attrs: term.AttrBold}, got.Selected)
+	assert.Equal(t, DefaultTheme.Inserted, got.Inserted, "unset keys keep the defaults")
+	assert.Equal(t, DefaultTheme.Insert, got.Insert)
+
+	vim := ThemeFrom(config.MapConfig(map[string]any{
+		"editor": map[string]any{"vim": map[string]any{"attr": map[string]any{"bg": "#202020"}}},
+	}))
+	assert.Equal(t, term.Attributes{Bg: term.NewHexColor(0x202020)}, vim.Text, "Rune's editor is vim by default")
+
+	assert.Equal(t, DefaultTheme, ThemeFrom(config.ErrConfig(os.ErrPermission)))
 }
 
 type fixture struct {
@@ -239,16 +563,20 @@ type fixture struct {
 	wm         *fakeWM
 	opener     *fakeOpener
 	fs         *memFS
+	parser     *fakeParser
+	editor     *fakeEditor
 	interrupts *atomicCount
 }
 
 func newFixture(t *testing.T) *fixture {
 	f := &fixture{
-		wm:         &fakeWM{split: make(chan browserapi.Handler, 4), content: make(chan browserapi.Handler, 4)},
+		wm:         &fakeWM{floating: make(chan browserapi.Handler, 4), content: make(chan browserapi.Handler, 4)},
 		opener:     &fakeOpener{},
 		fs:         newMemFS(map[string]string{target: "package main\n"}),
+		parser:     &fakeParser{},
 		interrupts: &atomicCount{},
 	}
+	f.editor = &fakeEditor{fs: f.fs}
 	f.mgr = New(Deps{
 		WindowManager: f.wm,
 		Opener:        f.opener,
@@ -257,6 +585,8 @@ func newFixture(t *testing.T) *fixture {
 			f.interrupts.Add()
 			return nil
 		}),
+		Parser:  f.parser,
+		Editor:  f.editor,
 		Root:    "/ws",
 		TempDir: "/tmp",
 	})
@@ -295,7 +625,7 @@ func (f *fixture) openDiff(
 	}()
 	var r *review
 	select {
-	case h := <-f.wm.split:
+	case h := <-f.wm.floating:
 		r = h.(*review)
 	case <-time.After(5 * time.Second):
 		t.Fatal("diff not shown")
@@ -308,10 +638,14 @@ func (f *fixture) openDiff(
 	return res, r
 }
 
-func (f *fixture) screen(r *review) string {
-	w := &screen{cells: map[term.Coordinates]rune{}}
+func (f *fixture) draw(r *review) *screen {
+	w := &screen{cells: map[term.Coordinates]term.Cell{}}
 	r.Draw(w)
-	return w.String(r.width, r.height)
+	return w
+}
+
+func (f *fixture) screen(r *review) string {
+	return f.draw(r).String(r.width, r.height)
 }
 
 func press(t *testing.T, r *review, ch rune, wantExit bool) {
@@ -363,11 +697,13 @@ func (c *atomicCount) Load() int {
 }
 
 type screen struct {
-	cells map[term.Coordinates]rune
+	cells map[term.Coordinates]term.Cell
 }
 
+func (s *screen) at(x, y int) term.Cell { return s.cells[term.Coordinates{X: x, Y: y}] }
+
 func (s *screen) Context() context.Context                          { return context.Background() }
-func (s *screen) SetCell(c term.Coordinates, cell term.Cell)        { s.cells[c] = cell.Ch }
+func (s *screen) SetCell(c term.Coordinates, cell term.Cell)        { s.cells[c] = cell }
 func (s *screen) UnionAttributes(term.Coordinates, term.Attributes) {}
 func (s *screen) DrawImage(term.Image) bool                         { return false }
 
@@ -376,11 +712,11 @@ func (s *screen) String(width, height int) string {
 	for y := range height {
 		var b strings.Builder
 		for x := range width {
-			ch, ok := s.cells[term.Coordinates{X: x, Y: y}]
+			cell, ok := s.cells[term.Coordinates{X: x, Y: y}]
 			if !ok {
-				ch = ' '
+				cell.Ch = ' '
 			}
-			b.WriteRune(ch)
+			b.WriteRune(cell.Ch)
 		}
 		rows = append(rows, strings.TrimRight(b.String(), " "))
 	}
@@ -393,28 +729,43 @@ func (w fakeWindow) WindowID() uint64 { return w.id }
 
 type fakeWM struct {
 	browserapi.WindowManager
-	split   chan browserapi.Handler
-	content chan browserapi.Handler
+	floating chan browserapi.Handler
+	content  chan browserapi.Handler
 
-	mu     sync.Mutex
-	closed []uint64
+	mu      sync.Mutex
+	closed  []uint64
+	configs []browserapi.FloatingConfig
+	shown   browserapi.Handler
 }
 
-func (w *fakeWM) Focus() (browserapi.Window, error) { return fakeWindow{1}, nil }
-
-func (w *fakeWM) Split(
-	o browserapi.Orientation, win browserapi.Window, h browserapi.Handler,
+func (w *fakeWM) Floating(
+	h browserapi.Floating, cfg browserapi.FloatingConfig,
 ) (browserapi.Window, error) {
-	if o != browserapi.OrientationRight || win.WindowID() != 1 {
-		panic("unexpected split")
-	}
-	w.split <- h
+	w.mu.Lock()
+	w.configs = append(w.configs, cfg)
+	w.shown = h
+	w.mu.Unlock()
+	w.floating <- h
 	return fakeWindow{2}, nil
 }
 
+func (w *fakeWM) lastConfig() browserapi.FloatingConfig {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.configs[len(w.configs)-1]
+}
+
+// SetWindowContent closes what the window showed, as Rune does.
 func (w *fakeWM) SetWindowContent(win browserapi.Window, h browserapi.Handler) error {
 	if win.WindowID() != 2 {
 		panic("unexpected window")
+	}
+	w.mu.Lock()
+	prev := w.shown
+	w.shown = h
+	w.mu.Unlock()
+	if prev != nil {
+		_ = prev.Close()
 	}
 	w.content <- h
 	return nil
@@ -431,6 +782,107 @@ func (w *fakeWM) closedIDs() []uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.closed
+}
+
+// editorAPI names the embedded textapi.Editor, whose Editor method
+// fakeEditor defines.
+type editorAPI = textapi.Editor
+
+// fakeEditor shows the files of fs, and records where the cursor of
+// each is put and the locations set in it.
+type fakeEditor struct {
+	editorAPI
+	fs *memFS
+
+	mu   sync.Mutex
+	set  map[string][]term.Coordinates
+	locs map[string][]textapi.Location
+}
+
+type fakeTextHandler struct {
+	textapi.Handler
+	uri string
+}
+
+func (e *fakeEditor) Editor(uri workspaceapi.URI) (textapi.Handler, error) {
+	return fakeTextHandler{uri: uri.String()}, nil
+}
+
+func (e *fakeEditor) SetCursor(h textapi.Handler, c term.Coordinates) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.set == nil {
+		e.set = map[string][]term.Coordinates{}
+	}
+	uri := h.(fakeTextHandler).uri
+	e.set[uri] = append(e.set[uri], c)
+	return nil
+}
+
+func (e *fakeEditor) cursors(uri string) []term.Coordinates {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.set[uri]
+}
+
+type fakeCellView struct {
+	e   *fakeEditor
+	uri string
+}
+
+func (e *fakeEditor) CellView(h textapi.Handler) textapi.CellView {
+	return fakeCellView{e: e, uri: h.(fakeTextHandler).uri}
+}
+
+// RawCells has no row for the line break the file ends with.
+func (v fakeCellView) RawCells() ([][]term.Cell, error) {
+	return cells(strings.TrimSuffix(v.e.fs.get(strings.TrimPrefix(v.uri, "file://")), "\n")), nil
+}
+
+func (e *fakeEditor) SetLocationList(
+	h textapi.Handler, _ textapi.LocationPriority, id string, list textapi.LocationList,
+) error {
+	var locs []textapi.Location
+	for loc, ok := list.Current(); ok; loc, ok = list.Next() {
+		locs = append(locs, loc)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.locs == nil {
+		e.locs = map[string][]textapi.Location{}
+	}
+	e.locs[h.(fakeTextHandler).uri+" "+id] = locs
+	return nil
+}
+
+func (e *fakeEditor) locations(uri, id string) []textapi.Location {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.locs[uri+" "+id]
+}
+
+// fakeParser highlights a text with the locations in locs for it.
+type fakeParser struct {
+	syntaxapi.Parser
+	locs map[string][]textapi.Location
+
+	mu    sync.Mutex
+	asked []string
+}
+
+func (p *fakeParser) Highlight(
+	uri workspaceapi.URI, content string,
+) (iterator.Iterator[textapi.Location], error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.asked = append(p.asked, uri.String())
+	return iterator.FromSlice(p.locs[content]), nil
+}
+
+func (p *fakeParser) uris() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.asked
 }
 
 type fakeHandler struct {
@@ -521,6 +973,12 @@ func (m *memFS) OpenFile(path string, flag int, _ os.FileMode) (workspaceapi.Fil
 		defer m.mu.Unlock()
 		m.files[path] = string(b)
 	}}, nil
+}
+
+func (m *memFS) put(path, s string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.files[path] = s
 }
 
 func (m *memFS) get(path string) string {
