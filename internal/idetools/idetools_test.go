@@ -243,13 +243,13 @@ func TestClaudeSend(t *testing.T) {
 		wantErr string
 	}{{
 		name:    "file",
-		cmd:     textapi.Command{Args: []string{"send"}, URI: main},
+		cmd:     textapi.Command{URI: main},
 		connect: true,
 		want:    `{"filePath":"/ws/main.go"}`,
 	}, {
 		name:    "selection",
 		setup:   func(f *fixture) { selectLines(f, main) },
-		cmd:     textapi.Command{Args: []string{"send"}, URI: main},
+		cmd:     textapi.Command{URI: main},
 		connect: true,
 		want:    `{"filePath":"/ws/main.go","lineStart":4,"lineEnd":6}`,
 	}, {
@@ -257,7 +257,7 @@ func TestClaudeSend(t *testing.T) {
 		setup: func(f *fixture) {
 			selectLines(f, mustURI(t, "file:///ws/other.go"))
 		},
-		cmd:     textapi.Command{Args: []string{"send"}, URI: main},
+		cmd:     textapi.Command{URI: main},
 		connect: true,
 		want:    `{"filePath":"/ws/main.go"}`,
 	}, {
@@ -269,16 +269,16 @@ func TestClaudeSend(t *testing.T) {
 				End: term.Coordinates{X: 1, Y: 6},
 			})
 		},
-		cmd:     textapi.Command{Args: []string{"send"}, URI: main},
+		cmd:     textapi.Command{URI: main},
 		connect: true,
 		want:    `{"filePath":"/ws/main.go"}`,
 	}, {
 		name:    "not connected",
-		cmd:     textapi.Command{Args: []string{"send"}, URI: main},
+		cmd:     textapi.Command{URI: main},
 		wantErr: "no Claude Code session",
 	}, {
 		name:    "no file",
-		cmd:     textapi.Command{Args: []string{"send"}},
+		cmd:     textapi.Command{},
 		connect: true,
 		wantErr: "focus a file",
 	}, {

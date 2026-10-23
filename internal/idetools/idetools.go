@@ -53,16 +53,12 @@ const (
 	diagnosticsTimeout = 10 * time.Second
 )
 
-// Command is the manual of the claude command, which HandleCommand
-// serves.
+// Command is the manual of the claudesend command, which HandleCommand
+// serves. It is not named claude: the package's config takes that name
+// for an alias that starts Claude Code in a new terminal tab.
 var Command = textapi.CommandManual{
-	Name:     "claude",
-	Summary:  "Send the current file and selection to Claude Code.",
-	Synopsis: "send",
-	Commands: []textapi.CommandManual{{
-		Name:    "send",
-		Summary: "Mention the current file and selected lines in Claude Code's prompt.",
-	}},
+	Name:    "claudesend",
+	Summary: "Mention the current file and selected lines in Claude Code's prompt.",
 }
 
 // Events are the editor events IDE.Handle expects.
@@ -223,11 +219,11 @@ func selectionOf(ev textapi.Event) ideserver.SelectionChanged {
 	return sel
 }
 
-// HandleCommand serves "claude send": it @-mentions the focused file in
+// HandleCommand serves "claudesend": it @-mentions the focused file in
 // Claude Code's prompt, with the selected lines if any.
 func (i *IDE) HandleCommand(_ context.Context, cmd textapi.Command) error {
-	if len(cmd.Args) != 1 || cmd.Args[0] != "send" {
-		return errors.New("usage: claude send")
+	if len(cmd.Args) != 0 {
+		return errors.New("usage: claudesend")
 	}
 	if cmd.URI.Path() == "" || cmd.URI.Scheme() != i.deps.Root.Scheme() {
 		return errors.New("focus a file to send it to Claude Code")

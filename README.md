@@ -31,7 +31,7 @@ everything the integration does.
 | Path | What it is |
 | --- | --- |
 | `cmd/extension_claude_code` | The Rune extension. One runs per workspace; it serves Claude Code's IDE protocol and Rune's tools on a loopback port it advertises in `~/.claude/ide`. |
-| `cmd/rune-claude` | `rune-claude mcp`, the stdio MCP server the plugin starts. It finds the workspace that contains Claude Code's working directory and relays to its extension. |
+| `cmd/rune-claude` | `rune-claude mcp`, the stdio MCP server the plugin starts, which relays to the extension of the workspace that contains Claude Code's working directory. `rune-claude claude`, which the package's `claude` command alias runs, starts Claude Code pinned to that workspace's IDE connection, since Claude Code connects by itself only when a single IDE contains its working directory. Both prefer the terminal's own workspace when workspaces nest. |
 | `plugin/` | The Claude Code plugin: the MCP server entry, a skill, and a hooks module for prompt completion, mentions, Grep references and the diagnostics pane. |
 | `.claude-plugin/marketplace.json` | Makes this repository a plugin marketplace. |
 

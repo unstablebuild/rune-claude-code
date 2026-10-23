@@ -20,6 +20,11 @@
 // serves the workspace's Rune tools as a stdio MCP server, bridging to
 // the Claude Code extension of the Rune workspace that contains the
 // working directory. The Claude Code plugin for Rune runs it.
+//
+//	rune-claude claude [args...]
+//
+// runs Claude Code with args, connected as its IDE to that same
+// workspace. Rune's claude command alias runs it.
 package main
 
 import (
@@ -30,8 +35,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -45,19 +52,27 @@ import (
 const usage = `usage: rune-claude <command>
 
 Commands:
-  mcp   Serve the Rune workspace's tools to Claude Code over stdio.
+  mcp                Serve the Rune workspace's tools to Claude Code over stdio.
+  claude [args...]   Run Claude Code connected to the Rune workspace.
 `
+
+// Claude Code reads these variables. Given ssePortEnv, it connects to
+// the IDE that listens on that port, ignoring the others.
+const (
+	autoConnectIDEEnv = "CLAUDE_CODE_AUTO_CONNECT_IDE"
+	ssePortEnv        = "CLAUDE_CODE_SSE_PORT"
+)
 
 // maxMessageSize bounds a single JSON-RPC message from Rune.
 const maxMessageSize = 64 << 20
 
 func main() {
-	if len(os.Args) != 2 {
+	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
-	switch os.Args[1] {
-	case "mcp":
+	switch cmd, args := os.Args[1], os.Args[2:]; {
+	case cmd == "mcp" && len(args) == 0:
 		ctx, stop := signal.NotifyContext(context.Background(),
 			os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -66,10 +81,56 @@ func main() {
 			stop()
 			os.Exit(1)
 		}
+	case cmd == "claude":
+		err := runClaude(args)
+		fmt.Fprintln(os.Stderr, "rune-claude:", err)
+		os.Exit(1)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
+}
+
+// runClaude replaces this process with Claude Code, run with args and
+// pinned to the IDE connection of the workspace findLock picks. On its
+// own, Claude Code connects only when exactly one IDE's folder contains
+// its working directory, which nested Rune workspaces break. It returns
+// only when Claude Code cannot be started.
+func runClaude(args []string) error {
+	path, err := exec.LookPath("claude")
+	if err != nil {
+		return fmt.Errorf("find Claude Code: %w", err)
+	}
+	port := 0
+	if lock, err := findLock(); err != nil {
+		fmt.Fprintf(os.Stderr, "rune-claude: %v; starting Claude Code anyway\n", err)
+	} else {
+		port = lock.Port
+	}
+	err = syscall.Exec(path, append([]string{"claude"}, args...),
+		claudeEnv(os.Environ(), port))
+	return fmt.Errorf("run %s: %w", path, err)
+}
+
+// claudeEnv returns env with Claude Code's IDE auto-connect turned on,
+// even where the user turned it off, since running Claude Code through
+// rune-claude asks to connect. A port other than zero pins the
+// connection to the IDE that listens on it.
+func claudeEnv(env []string, port int) []string {
+	set := []string{autoConnectIDEEnv + "=true"}
+	if port != 0 {
+		set = append(set, ssePortEnv+"="+strconv.Itoa(port))
+	}
+	out := make([]string, 0, len(env)+len(set))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if !slices.ContainsFunc(set, func(s string) bool {
+			return strings.HasPrefix(s, name+"=")
+		}) {
+			out = append(out, kv)
+		}
+	}
+	return append(out, set...)
 }
 
 // serveMCP bridges in and out, a stdio MCP transport, to the tools of

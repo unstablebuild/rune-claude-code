@@ -81,6 +81,37 @@ func TestPick(t *testing.T) {
 	}
 }
 
+func TestClaudeEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		port int
+		want []string
+	}{{
+		name: "pins port",
+		env:  []string{"HOME=/h", "CLAUDE_CODE_SSE_PORT=1", "CLAUDE_CODE_SSE_PORTX=2"},
+		port: 4242,
+		want: []string{"HOME=/h", "CLAUDE_CODE_SSE_PORTX=2",
+			"CLAUDE_CODE_AUTO_CONNECT_IDE=true", "CLAUDE_CODE_SSE_PORT=4242"},
+	}, {
+		name: "overrides auto-connect off",
+		env:  []string{"CLAUDE_CODE_AUTO_CONNECT_IDE=false", "HOME=/h"},
+		port: 4242,
+		want: []string{"HOME=/h",
+			"CLAUDE_CODE_AUTO_CONNECT_IDE=true", "CLAUDE_CODE_SSE_PORT=4242"},
+	}, {
+		name: "no workspace keeps port",
+		env:  []string{"HOME=/h", "CLAUDE_CODE_SSE_PORT=1"},
+		want: []string{"HOME=/h", "CLAUDE_CODE_SSE_PORT=1",
+			"CLAUDE_CODE_AUTO_CONNECT_IDE=true"},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, claudeEnv(tt.env, tt.port))
+		})
+	}
+}
+
 func TestServeMCP(t *testing.T) {
 	cfgDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", cfgDir)
